@@ -12,6 +12,12 @@ function inferToolType(command: string, transcript: string): { icon: string; lab
   const cmd = command.toLowerCase();
   const t = transcript.toLowerCase();
 
+  if (cmd.includes('opening') && (cmd.includes('http') || cmd.includes('browser'))) {
+    return { icon: '\uD83C\uDF10', label: 'OPEN LINK' };
+  }
+  if (cmd.includes('scraping')) {
+    return { icon: '\uD83E\uDDFE', label: 'WEB SCRAPE' };
+  }
   if (
     cmd.includes('ls') ||
     cmd.includes('cd') ||
@@ -123,12 +129,6 @@ export function AgentWidget({ agentId }: AgentWidgetProps) {
     }
     if (!text.trim()) return;
 
-    const history: ConversationMessage[] = [
-      ...agent.conversationHistory,
-      { role: 'user', content: agent.transcript },
-      { role: 'assistant', content: agent.response }
-    ];
-
     const captures: ScreenCapturePayload[] = [];
     try {
       captures.push(await window.clicky.captureSelectedScreen());
@@ -145,21 +145,33 @@ export function AgentWidget({ agentId }: AgentWidgetProps) {
       transcript: text.trim(),
       captures,
       model: agent.model,
-      conversationHistory: history,
+      conversationHistory: agent.conversationHistory,
       agentId
     });
-  }, [agent, agentId, followUpMode, followUpText, transcript, stopRecording]);
+  }, [agent, agentId, followUpMode, followUpText, stopRecording]);
 
   const startVoiceFollowUp = useCallback(async () => {
     setFollowUpMode('voice');
     setResponse('');
-    await startRecording();
-  }, [startRecording]);
+    await startRecording({
+      silenceMs: 2000,
+      onSilence: () => {
+        void submitFollowUp();
+      }
+    });
+  }, [startRecording, submitFollowUp]);
 
   const stopVoiceFollowUp = useCallback(async () => {
     await stopRecording();
     setFollowUpMode('none');
   }, [stopRecording]);
+
+  const handleTextKeyDown = useCallback((e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      void submitFollowUp();
+    }
+  }, [submitFollowUp]);
 
   const status = agent?.status ?? 'running';
   const isDone = status === 'done';
@@ -199,7 +211,15 @@ export function AgentWidget({ agentId }: AgentWidgetProps) {
             )}
             <div className="agent-status running">
               <span className="status-indicator" />
-              <span>{activeCommand ? 'Executing shell command...' : 'Running'}</span>
+              <span>
+                {activeCommand
+                  ? (activeCommand.toLowerCase().includes('opening') && activeCommand.toLowerCase().includes('browser')
+                      ? 'Opening link in browser...'
+                      : activeCommand.toLowerCase().includes('scraping')
+                        ? 'Scraping website...'
+                        : 'Executing shell command...')
+                  : 'Running'}
+              </span>
             </div>
           </>
         )}
@@ -254,6 +274,7 @@ export function AgentWidget({ agentId }: AgentWidgetProps) {
           <textarea
             value={followUpText}
             onChange={(e) => setFollowUpText(e.target.value)}
+            onKeyDown={handleTextKeyDown}
             placeholder="Type follow-up..."
             rows={2}
           />

@@ -9,6 +9,7 @@ export function Recorder() {
   const stopRecordingRef = useRef(stopRecording);
   const captureRef = useRef<ScreenCapturePayload | undefined>(undefined);
   const isStoppingRef = useRef(false);
+  const [status, setStatus] = useState<'idle' | 'listening' | 'processing'>('idle');
 
   useEffect(() => {
     isRecordingRef.current = isRecording;
@@ -40,6 +41,7 @@ export function Recorder() {
       return;
     }
     isStoppingRef.current = true;
+    setStatus('processing');
     console.log('[clicky:orb] stopping active recording', { reason });
     const audio = await stopRecordingRef.current();
     if (!audio) {
@@ -109,6 +111,7 @@ export function Recorder() {
     } catch (err) {
       console.error('[clicky:orb] background screenshot failed:', err);
     }
+    setStatus('listening');
     console.log('[clicky:orb] starting microphone recording with silence auto-stop');
     await startRecordingRef.current({
       silenceMs: 2000,
@@ -122,18 +125,26 @@ export function Recorder() {
   return (
     <div className="listening-orb">
       <div className="orb-circle">
-        <div className="waveform">
-          {[...Array(5)].map((_, i) => (
-            <div
-              key={i}
-              className="waveform-bar"
-              style={{
-                animationDelay: `${i * 0.12}s`,
-                transform: `scaleY(${0.4 + level * 1.2})`
-              }}
-            />
-          ))}
-        </div>
+        {status === 'idle' && <div className="idle-cursor" />}
+        {status === 'listening' ? (
+          <div className="waveform">
+            {[...Array(5)].map((_, i) => (
+              <div
+                key={i}
+                className="waveform-bar"
+                style={{
+                  transform: `scaleY(${0.4 + level * 1.2})`
+                }}
+              />
+            ))}
+          </div>
+        ) : status === 'processing' ? (
+          <div className="loading-spinner">
+            <div className="spinner-dot" />
+            <div className="spinner-dot" />
+            <div className="spinner-dot" />
+          </div>
+        ) : null}
       </div>
     </div>
   );

@@ -43,6 +43,44 @@ export const checkEmailTool: LlmTool = {
   }
 };
 
+export const openUrlTool: LlmTool = {
+  type: 'function',
+  function: {
+    name: 'open_url',
+    description:
+      'Opens a specified web URL in the user\'s default web browser. Use this if the user explicitly asks to open a link, visit a website, or if you extract a relevant link from the screen context that the user wants to see.',
+    parameters: {
+      type: 'object',
+      properties: {
+        url: {
+          type: 'string',
+          description: 'The web URL to open. Must be a valid http or https URL.'
+        }
+      },
+      required: ['url']
+    }
+  }
+};
+
+export const scrapeWebsiteTool: LlmTool = {
+  type: 'function',
+  function: {
+    name: 'scrape_website',
+    description:
+      'Fetches and extracts readable text content from a web URL. Use this when the user asks about content on a specific website, wants to summarize a page, or needs information from a web page. Returns the extracted text content.',
+    parameters: {
+      type: 'object',
+      properties: {
+        url: {
+          type: 'string',
+          description: 'The web URL to scrape. Must be a valid http or https URL.'
+        }
+      },
+      required: ['url']
+    }
+  }
+};
+
 function getOpenAIApiKey(): string {
   const key = process.env.OPENAI_API_KEY;
   if (!key) {
@@ -57,10 +95,12 @@ function buildOpenAIMessages(request: VoiceTurnRequest): unknown[] {
   messages.push({
     role: 'system',
     content:
-      'You are Clicky, a Linux desktop AI assistant with TOOL ACCESS. You have two tools: execute_bash_command and check_email.\n\n' +
+      'You are Clicky, a Linux desktop AI assistant with TOOL ACCESS. You have four tools: execute_bash_command, check_email, open_url, and scrape_website.\n\n' +
       'RULE 1: When the user asks about emails, inbox, messages, or mail — you MUST call the check_email tool. Do not answer from memory. Do not say you cannot access emails. The tool IS available and WILL work.\n\n' +
       'RULE 2: When the user asks about files, directories, system info, or running commands — you MUST call the execute_bash_command tool.\n\n' +
-      'RULE 3: Never claim you cannot do something that a tool can do. Always use the appropriate tool.'
+      'RULE 3: When the user asks to open a link, visit a website, or if you see a relevant URL in the screen context the user wants to visit — you MUST call the open_url tool.\n\n' +
+      'RULE 4: When the user asks about content on a website, wants to summarize a page, or needs information from a web page — you MUST call the scrape_website tool.\n\n' +
+      'RULE 5: Never claim you cannot do something that a tool can do. Always use the appropriate tool.'
   });
 
   for (const entry of request.conversationHistory) {
@@ -195,6 +235,22 @@ export class WorkerApi {
           name: checkEmailTool.function.name,
           description: checkEmailTool.function.description,
           parameters: checkEmailTool.function.parameters
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: openUrlTool.function.name,
+          description: openUrlTool.function.description,
+          parameters: openUrlTool.function.parameters
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: scrapeWebsiteTool.function.name,
+          description: scrapeWebsiteTool.function.description,
+          parameters: scrapeWebsiteTool.function.parameters
         }
       }
     ];

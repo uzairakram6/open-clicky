@@ -116,27 +116,29 @@ function openRecorderOrb(): void {
 function createOrbWindow(): void {
   const cursor = screen.getCursorScreenPoint();
   const display = screen.getDisplayNearestPoint(cursor);
-  const size = 120;
-  const margin = 12;
+  const width = 80;
+  const height = 40;
+  const offset = 15;
 
-  let x = cursor.x + margin;
-  let y = cursor.y - size / 2;
+  let x = cursor.x + offset;
+  let y = cursor.y + offset;
 
   const bounds = display.workArea;
-  x = Math.max(bounds.x, Math.min(x, bounds.x + bounds.width - size));
-  y = Math.max(bounds.y, Math.min(y, bounds.y + bounds.height - size));
+  x = Math.max(bounds.x, Math.min(x, bounds.x + bounds.width - width));
+  y = Math.max(bounds.y, Math.min(y, bounds.y + bounds.height - height));
 
   console.log('[clicky:orb] creating orb window', {
     cursor,
     display: display.id,
     x,
     y,
-    size
+    width,
+    height
   });
 
   const win = new BrowserWindow({
-    width: size,
-    height: size,
+    width,
+    height,
     x,
     y,
     frame: false,
@@ -168,6 +170,7 @@ function createOrbWindow(): void {
     console.log('[clicky:orb] renderer loaded');
     if (!win.isDestroyed()) {
       win.show();
+      win.setIgnoreMouseEvents(true);
       recorderWindowReady = true;
       // Delay the start message so React has time to mount and register IPC listeners
       setTimeout(() => {
@@ -401,6 +404,46 @@ function splitEnvList(value: string | undefined): string[] {
     .filter(Boolean) ?? [];
 }
 
+async function scrapeWebsiteContent(url: string): Promise<string> {
+  console.log('[clicky:scrape] fetching', { url });
+  const response = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
+  });
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status} ${response.statusText}`);
+  }
+  const html = await response.text();
+  console.log('[clicky:scrape] fetched', { url, bytes: html.length });
+
+  // Remove script, style, noscript, iframe tags and their contents
+  let text = html
+    .replace(/<(script|style|noscript|iframe|nav|footer|header|aside)[\s\S]*?<\/\1>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#\d+;/g, (match) => {
+      try {
+        return String.fromCharCode(parseInt(match.slice(2, -1), 10));
+      } catch {
+        return match;
+      }
+    })
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const maxChars = 8000;
+  if (text.length > maxChars) {
+    text = text.slice(0, maxChars) + '\n\n[Content truncated]';
+  }
+  console.log('[clicky:scrape] extracted text', { url, chars: text.length });
+  return text;
+}
+
 function registerPushToTalkShortcut(): void {
   const shortcut = process.env.CLICKY_HOTKEY ?? 'Control+Alt+Space';
   const registered = globalShortcut.register(shortcut, () => {
@@ -554,12 +597,107 @@ async function processAgentStream(
         await processAgentStream(api, toolResultRequest, win, state, agentId);
         return;
       }
+    } else if (event.type === 'tool_call' && event.name === 'open_url') {
+      console.log('[clicky:agent] TOOL_CALL open_url RECEIVED', { agentId, args: event.arguments });
+      let args: { url?: string } = {};
+      try {
+        args = event.arguments ? JSON.parse(event.arguments) as { url?: string } : {};
+      } catch {
+        args = {};
+      }
+      const url = args.url;
+      if (url) {
+        safeSend(win, ipcChannels.agentCommandFlash, `Opening ${url} in browser...`);
+        try {
+          await shell.openExternal(url);
+          console.log('[clicky:agent] URL opened successfully', { agentId, url });
+          const toolResultRequest: VoiceTurnRequest = {
+            transcript: `The link has been opened in the user's default browser.`,
+            captures: [],
+            model: request.model,
+            conversationHistory: [
+              ...request.conversationHistory,
+              { role: 'user', content: request.transcript },
+              { role: 'assistant', content: fullResponse }
+            ],
+            agentId
+          };
+          await processAgentStream(api, toolResultRequest, win, state, agentId);
+          return;
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          console.error('[clicky:agent] open_url failed', { agentId, url, error: message });
+          const toolResultRequest: VoiceTurnRequest = {
+            transcript: `I was unable to open the link. Error: ${message}`,
+            captures: [],
+            model: request.model,
+            conversationHistory: [
+              ...request.conversationHistory,
+              { role: 'user', content: request.transcript },
+              { role: 'assistant', content: fullResponse }
+            ],
+            agentId
+          };
+          await processAgentStream(api, toolResultRequest, win, state, agentId);
+          return;
+        }
+      }
+    } else if (event.type === 'tool_call' && event.name === 'scrape_website') {
+      console.log('[clicky:agent] TOOL_CALL scrape_website RECEIVED', { agentId, args: event.arguments });
+      let args: { url?: string } = {};
+      try {
+        args = event.arguments ? JSON.parse(event.arguments) as { url?: string } : {};
+      } catch {
+        args = {};
+      }
+      const url = args.url;
+      if (url) {
+        safeSend(win, ipcChannels.agentCommandFlash, `Scraping ${url}...`);
+        try {
+          const scrapedText = await scrapeWebsiteContent(url);
+          console.log('[clicky:agent] website scraped successfully', { agentId, url });
+          const toolResultRequest: VoiceTurnRequest = {
+            transcript: `Here is the content from ${url}:\n\n${scrapedText}`,
+            captures: [],
+            model: request.model,
+            conversationHistory: [
+              ...request.conversationHistory,
+              { role: 'user', content: request.transcript },
+              { role: 'assistant', content: fullResponse }
+            ],
+            agentId
+          };
+          await processAgentStream(api, toolResultRequest, win, state, agentId);
+          return;
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          console.error('[clicky:agent] scrape_website failed', { agentId, url, error: message });
+          const toolResultRequest: VoiceTurnRequest = {
+            transcript: `I was unable to scrape the website. Error: ${message}`,
+            captures: [],
+            model: request.model,
+            conversationHistory: [
+              ...request.conversationHistory,
+              { role: 'user', content: request.transcript },
+              { role: 'assistant', content: fullResponse }
+            ],
+            agentId
+          };
+          await processAgentStream(api, toolResultRequest, win, state, agentId);
+          return;
+        }
+      }
     } else if (event.type === 'done') {
       state.status = 'done';
       state.response = fullResponse;
       state.summary = fullResponse.slice(0, 200) + (fullResponse.length > 200 ? '...' : '');
       state.completedAt = Date.now();
       state.actions = buildDefaultActions(request.transcript);
+      state.conversationHistory = [
+        ...request.conversationHistory,
+        { role: 'user', content: request.transcript },
+        { role: 'assistant', content: fullResponse }
+      ];
       console.log('[clicky:agent] stream done', {
         agentId,
         responseChars: fullResponse.length,
@@ -613,7 +751,32 @@ ipcMain.handle(ipcChannels.captureSetSelectedScreen, async (_event, source: Capt
   return settings;
 });
 
+function isWayland(): boolean {
+  return process.env.XDG_SESSION_TYPE === 'wayland' || !!process.env.WAYLAND_DISPLAY;
+}
+
+async function tryGrimScreenshot(): Promise<ScreenCapturePayload | null> {
+  if (!isWayland()) return null;
+  try {
+    const tmpPath = join(tmpdir(), `clicky-screenshot-${randomUUID()}.jpg`);
+    const display = screen.getPrimaryDisplay();
+    const { width, height } = display.size;
+    await execAsync(`grim -t jpeg -q 82 "${tmpPath}"`, { timeout: 10000 });
+    const jpegBuffer = await readFile(tmpPath);
+    await unlink(tmpPath).catch(() => {});
+    return {
+      jpegBase64: jpegBuffer.toString('base64'),
+      label: 'Linux screen (grim)',
+      width,
+      height
+    };
+  } catch {
+    return null;
+  }
+}
+
 async function tryFfmpegScreenshot(): Promise<ScreenCapturePayload | null> {
+  if (isWayland()) return null;
   try {
     const tmpPath = join(tmpdir(), `clicky-screenshot-${randomUUID()}.jpg`);
     const display = screen.getPrimaryDisplay();
@@ -623,7 +786,7 @@ async function tryFfmpegScreenshot(): Promise<ScreenCapturePayload | null> {
     await unlink(tmpPath).catch(() => {});
     return {
       jpegBase64: jpegBuffer.toString('base64'),
-      label: 'Linux screen',
+      label: 'Linux screen (ffmpeg)',
       width,
       height
     };
@@ -633,13 +796,22 @@ async function tryFfmpegScreenshot(): Promise<ScreenCapturePayload | null> {
 }
 
 ipcMain.handle(ipcChannels.captureTakeScreenshot, async (): Promise<ScreenCapturePayload> => {
-  const ffmpegResult = await tryFfmpegScreenshot();
-  if (ffmpegResult) {
-    console.log('[clicky:capture] screenshot taken via ffmpeg');
-    return ffmpegResult;
+  if (isWayland()) {
+    const grimResult = await tryGrimScreenshot();
+    if (grimResult) {
+      console.log('[clicky:capture] screenshot taken via grim');
+      return grimResult;
+    }
+    console.log('[clicky:capture] grim failed, falling back to desktopCapturer');
+  } else {
+    const ffmpegResult = await tryFfmpegScreenshot();
+    if (ffmpegResult) {
+      console.log('[clicky:capture] screenshot taken via ffmpeg');
+      return ffmpegResult;
+    }
+    console.log('[clicky:capture] ffmpeg failed, falling back to desktopCapturer');
   }
 
-  console.log('[clicky:capture] ffmpeg unavailable, falling back to desktopCapturer');
   const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 1280, height: 1280 } });
   const cursor = screen.getCursorScreenPoint();
   const currentDisplay = screen.getDisplayNearestPoint(cursor);
@@ -782,6 +954,16 @@ ipcMain.handle(ipcChannels.agentRunAction, async (_event, action: AgentAction) =
   } else if (action.type === 'open_url' && action.payload) {
     await shell.openExternal(action.payload);
   }
+});
+
+ipcMain.handle(ipcChannels.openUrl, async (_event, url: string) => {
+  console.log('[clicky:main] openUrl invoked', { url });
+  await shell.openExternal(url);
+});
+
+ipcMain.handle(ipcChannels.scrapeWebsite, async (_event, url: string): Promise<string> => {
+  console.log('[clicky:main] scrapeWebsite invoked', { url });
+  return scrapeWebsiteContent(url);
 });
 
 ipcMain.handle(ipcChannels.windowGetContext, (event): WindowContext | undefined => {

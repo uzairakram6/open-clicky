@@ -24,5 +24,7 @@ export const ipcChannels = {
   agentFollowUp: 'agent:followUp',
   agentRunAction: 'agent:runAction',
   windowGetContext: 'window:getContext',
-  executeShell: 'shell:execute'
+  executeShell: 'shell:execute',
+  openUrl: 'open-url',
+  scrapeWebsite: 'scrape:website'
 } as const;

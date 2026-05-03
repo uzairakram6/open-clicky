@@ -14,6 +14,7 @@ describe('IPC channel contract', () => {
       transcribeGetToken: 'transcribe:getToken',
       ttsSpeak: 'tts:speak',
       recordingStart: 'recording:start',
+      recordingStop: 'recording:stop',
       chatChunk: 'chat:chunk',
       chatDone: 'chat:done',
       chatError: 'chat:error',
@@ -28,7 +29,9 @@ describe('IPC channel contract', () => {
       agentFollowUp: 'agent:followUp',
       agentRunAction: 'agent:runAction',
       windowGetContext: 'window:getContext',
-      executeShell: 'shell:execute'
+      executeShell: 'shell:execute',
+      openUrl: 'open-url',
+      scrapeWebsite: 'scrape:website'
     });
   });
 });
