@@ -7,7 +7,7 @@ const api = {
   setSettings: (settings: AppSettings): Promise<AppSettings> => ipcRenderer.invoke(ipcChannels.settingsSet, settings),
   selectScreens: (): Promise<CaptureSource[]> => ipcRenderer.invoke(ipcChannels.captureSelectScreen),
   setSelectedScreen: (source: CaptureSource): Promise<AppSettings> => ipcRenderer.invoke(ipcChannels.captureSetSelectedScreen, source),
-  captureSelectedScreen: (): Promise<ScreenCapturePayload> => captureSelectedScreen(),
+  captureSelectedScreen: (): Promise<ScreenCapturePayload> => ipcRenderer.invoke(ipcChannels.captureTakeScreenshot),
   takeScreenshot: (): Promise<ScreenCapturePayload> => ipcRenderer.invoke(ipcChannels.captureTakeScreenshot),
   sendTurn: (request: VoiceTurnRequest): Promise<void> => ipcRenderer.invoke(ipcChannels.chatSendTurn, request),
   transcribeAudio: (payload: RecordedAudioPayload): Promise<string> => ipcRenderer.invoke(ipcChannels.audioTranscribe, payload),
@@ -37,47 +37,6 @@ function listen<T extends unknown[]>(channel: string, callback: (...args: T) => 
   const handler = (_event: Electron.IpcRendererEvent, ...args: T) => callback(...args);
   ipcRenderer.on(channel, handler);
   return () => ipcRenderer.off(channel, handler);
-}
-
-async function captureSelectedScreen(): Promise<ScreenCapturePayload> {
-  const stream = await navigator.mediaDevices.getDisplayMedia({
-    video: { width: { ideal: 1280 }, height: { ideal: 1280 } },
-    audio: false
-  });
-
-  try {
-    const video = document.createElement('video');
-    video.srcObject = stream;
-    await video.play();
-
-    const track = stream.getVideoTracks()[0];
-    const settings = track.getSettings();
-    const width = settings.width ?? video.videoWidth;
-    const height = settings.height ?? video.videoHeight;
-    const scale = Math.min(1, 1280 / Math.max(width, height));
-    const canvas = document.createElement('canvas');
-    canvas.width = Math.round(width * scale);
-    canvas.height = Math.round(height * scale);
-
-    const context = canvas.getContext('2d');
-    if (!context) {
-      throw new Error('Unable to create capture canvas');
-    }
-
-    context.drawImage(video, 0, 0, canvas.width, canvas.height);
-    const dataUrl = canvas.toDataURL('image/jpeg', 0.82);
-
-    return {
-      jpegBase64: dataUrl.replace(/^data:image\/jpeg;base64,/, ''),
-      label: 'selected Linux screen',
-      width: canvas.width,
-      height: canvas.height
-    };
-  } finally {
-    for (const track of stream.getTracks()) {
-      track.stop();
-    }
-  }
 }
 
 declare global {

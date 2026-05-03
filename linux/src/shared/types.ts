@@ -21,12 +21,22 @@ export interface LlmTool {
   };
 }
 
+export interface EmailConfig {
+  enabled: boolean;
+  provider: 'gmail' | 'outlook' | 'yahoo' | 'custom';
+  username: string;
+  password: string;
+  imapHost?: string;
+  imapPort?: number;
+}
+
 export interface AppSettings {
   workerBaseUrl: string;
   model: string;
   selectedCaptureSourceId?: string;
   selectedCaptureSourceLabel?: string;
   onboarded: boolean;
+  email?: EmailConfig;
 }
 
 export interface ScreenCapturePayload {

@@ -51,7 +51,8 @@ async function initApp(): Promise<void> {
   console.log('[clicky:main] settings loaded', {
     workerBaseUrl: settings.workerBaseUrl,
     model: settings.model,
-    selectedCaptureSourceLabel: settings.selectedCaptureSourceLabel
+    selectedCaptureSourceLabel: settings.selectedCaptureSourceLabel,
+    email: settings.email
   });
 
   session.defaultSession.setDisplayMediaRequestHandler((request, callback) => {
@@ -64,7 +65,7 @@ async function initApp(): Promise<void> {
       });
       callback(source ? { video: source, audio: 'loopback' } : {});
     });
-  }, { useSystemPicker: true });
+  }, { useSystemPicker: false });
 
   createTray();
   registerPushToTalkShortcut();
@@ -301,7 +302,7 @@ async function transcribeWithWhisper(audio: RecordedAudioPayload): Promise<strin
   try {
     const fileBytes = await readFile(audioPath);
     const form = new FormData();
-    form.append('model', 'whisper-1');
+    form.append('model', 'gpt-4o-transcribe');
     form.append('file', new Blob([fileBytes], { type: audio.mimeType || 'audio/webm' }), `clicky${extension}`);
 
     console.log('[clicky:whisper] sending audio to OpenAI transcription endpoint');
@@ -501,6 +502,58 @@ async function processAgentStream(
         await processAgentStream(api, toolResultRequest, win, state, agentId);
         return;
       }
+    } else if (event.type === 'tool_call' && event.name === 'check_email') {
+      console.log('[clicky:agent] TOOL_CALL check_email RECEIVED', { agentId, args: event.arguments });
+      let args: { count?: number } = {};
+      try {
+        args = event.arguments ? JSON.parse(event.arguments) as { count?: number } : {};
+      } catch {
+        args = {};
+      }
+      const count = Math.min(Math.max(args.count ?? 5, 1), 10);
+      console.log('[clicky:agent] checking emails', { agentId, count, emailSettings: JSON.stringify(settings.email) });
+      safeSend(win, ipcChannels.agentCommandFlash, 'Checking emails...');
+
+      try {
+        const { fetchRecentEmails } = await import('./emailService');
+        const emailConfig = settings.email ?? { enabled: false, provider: 'gmail', username: '', password: '' };
+        console.log('[clicky:agent] email config resolved', { enabled: emailConfig.enabled, username: emailConfig.username, hasPassword: !!emailConfig.password });
+        const emails = await fetchRecentEmails(emailConfig, count);
+        const emailSummary = emails.length === 0
+          ? 'No emails found in your inbox.'
+          : emails.map((e, i) => `${i + 1}. From: ${e.from}\nSubject: ${e.subject}\nDate: ${e.date}\nPreview: ${e.preview}`).join('\n\n');
+
+        const toolResultRequest: VoiceTurnRequest = {
+          transcript: `Here are the recent emails:\n${emailSummary}`,
+          captures: [],
+          model: request.model,
+          conversationHistory: [
+            ...request.conversationHistory,
+            { role: 'user', content: request.transcript },
+            { role: 'assistant', content: fullResponse }
+          ],
+          agentId
+        };
+
+        await processAgentStream(api, toolResultRequest, win, state, agentId);
+        return;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.error('[clicky:agent] email check failed', { agentId, error: message });
+        const toolResultRequest: VoiceTurnRequest = {
+          transcript: `I was unable to check your emails. Error: ${message}`,
+          captures: [],
+          model: request.model,
+          conversationHistory: [
+            ...request.conversationHistory,
+            { role: 'user', content: request.transcript },
+            { role: 'assistant', content: fullResponse }
+          ],
+          agentId
+        };
+        await processAgentStream(api, toolResultRequest, win, state, agentId);
+        return;
+      }
     } else if (event.type === 'done') {
       state.status = 'done';
       state.response = fullResponse;
@@ -560,7 +613,33 @@ ipcMain.handle(ipcChannels.captureSetSelectedScreen, async (_event, source: Capt
   return settings;
 });
 
+async function tryFfmpegScreenshot(): Promise<ScreenCapturePayload | null> {
+  try {
+    const tmpPath = join(tmpdir(), `clicky-screenshot-${randomUUID()}.jpg`);
+    const display = screen.getPrimaryDisplay();
+    const { width, height } = display.size;
+    await execAsync(`ffmpeg -f x11grab -video_size ${width}x${height} -i :0.0 -vframes 1 -q:v 5 -y "${tmpPath}"`, { timeout: 10000 });
+    const jpegBuffer = await readFile(tmpPath);
+    await unlink(tmpPath).catch(() => {});
+    return {
+      jpegBase64: jpegBuffer.toString('base64'),
+      label: 'Linux screen',
+      width,
+      height
+    };
+  } catch {
+    return null;
+  }
+}
+
 ipcMain.handle(ipcChannels.captureTakeScreenshot, async (): Promise<ScreenCapturePayload> => {
+  const ffmpegResult = await tryFfmpegScreenshot();
+  if (ffmpegResult) {
+    console.log('[clicky:capture] screenshot taken via ffmpeg');
+    return ffmpegResult;
+  }
+
+  console.log('[clicky:capture] ffmpeg unavailable, falling back to desktopCapturer');
   const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 1280, height: 1280 } });
   const cursor = screen.getCursorScreenPoint();
   const currentDisplay = screen.getDisplayNearestPoint(cursor);

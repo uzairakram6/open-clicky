@@ -18,7 +18,12 @@
     "smoke:packaged": "bash scripts/smoke-packaged-renderer.sh",
     "test": "vitest run"
   },
-  "dependencies": {},
+  "dependencies": {
+    "@types/imap": "^0.8.43",
+    "@types/mailparser": "^3.4.6",
+    "imap": "^0.8.19",
+    "mailparser": "^3.9.8"
+  },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@types/react": "^19.0.0",
