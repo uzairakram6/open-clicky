@@ -1,9 +1,29 @@
 export type VoiceState = 'idle' | 'listening' | 'processing' | 'responding';
 
+export type AgentStatus = 'running' | 'done' | 'error';
+
+export interface ShellResult {
+  stdout: string;
+  stderr: string;
+  error: string | null;
+}
+
+export interface LlmTool {
+  type: 'function';
+  function: {
+    name: string;
+    description: string;
+    parameters: {
+      type: 'object';
+      properties: Record<string, unknown>;
+      required?: string[];
+    };
+  };
+}
+
 export interface AppSettings {
   workerBaseUrl: string;
   model: string;
-  shortcut: string;
   selectedCaptureSourceId?: string;
   selectedCaptureSourceLabel?: string;
   onboarded: boolean;
@@ -26,12 +46,15 @@ export interface VoiceTurnRequest {
   captures: ScreenCapturePayload[];
   model: string;
   conversationHistory: ConversationMessage[];
+  agentId?: string;
 }
 
 export interface ChatStreamEvent {
-  type: 'chunk' | 'done' | 'error';
+  type: 'chunk' | 'done' | 'error' | 'tool_call';
   text?: string;
   error?: string;
+  name?: string;
+  arguments?: string;
 }
 
 export interface CaptureSource {
@@ -43,4 +66,37 @@ export interface CaptureSource {
 export interface TranscribeTokenResponse {
   token: string;
   expiresAt?: string;
+}
+
+export interface RecordedAudioPayload {
+  bytes: ArrayBuffer;
+  mimeType: string;
+}
+
+export interface AgentAction {
+  id: string;
+  label: string;
+  type: 'open_app' | 'open_folder' | 'open_url' | 'copy' | 'custom';
+  payload?: string;
+}
+
+export interface AgentState {
+  id: string;
+  status: AgentStatus;
+  transcript: string;
+  response: string;
+  summary: string;
+  commands: string[];
+  actions: AgentAction[];
+  error?: string;
+  createdAt: number;
+  completedAt?: number;
+  model: string;
+  conversationHistory: ConversationMessage[];
+  captures: ScreenCapturePayload[];
+}
+
+export interface WindowContext {
+  type: 'recorder' | 'agent';
+  agentId?: string;
 }

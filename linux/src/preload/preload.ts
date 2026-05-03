@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer } from 'electron';
 import { ipcChannels } from '../shared/ipcChannels';
-import type { AppSettings, CaptureSource, ScreenCapturePayload, TranscribeTokenResponse, VoiceTurnRequest } from '../shared/types';
+import type { AppSettings, CaptureSource, ScreenCapturePayload, ShellResult, TranscribeTokenResponse, VoiceTurnRequest, WindowContext, AgentState, AgentAction, RecordedAudioPayload } from '../shared/types';
 
 const api = {
   getSettings: (): Promise<AppSettings> => ipcRenderer.invoke(ipcChannels.settingsGet),
@@ -8,15 +8,26 @@ const api = {
   selectScreens: (): Promise<CaptureSource[]> => ipcRenderer.invoke(ipcChannels.captureSelectScreen),
   setSelectedScreen: (source: CaptureSource): Promise<AppSettings> => ipcRenderer.invoke(ipcChannels.captureSetSelectedScreen, source),
   captureSelectedScreen: (): Promise<ScreenCapturePayload> => captureSelectedScreen(),
+  takeScreenshot: (): Promise<ScreenCapturePayload> => ipcRenderer.invoke(ipcChannels.captureTakeScreenshot),
   sendTurn: (request: VoiceTurnRequest): Promise<void> => ipcRenderer.invoke(ipcChannels.chatSendTurn, request),
+  transcribeAudio: (payload: RecordedAudioPayload): Promise<string> => ipcRenderer.invoke(ipcChannels.audioTranscribe, payload),
   getTranscribeToken: (): Promise<TranscribeTokenResponse> => ipcRenderer.invoke(ipcChannels.transcribeGetToken),
-  speak: (text: string): Promise<void> => ipcRenderer.invoke(ipcChannels.ttsSpeak, text),
-  onVoiceToggle: (callback: () => void) => listen(ipcChannels.voiceToggle, callback),
+  speak: (text: string, agentId?: string): Promise<void> => ipcRenderer.invoke(ipcChannels.ttsSpeak, text, agentId),
+  spawnAgent: (request: VoiceTurnRequest): Promise<string> => ipcRenderer.invoke(ipcChannels.agentSpawn, request),
+  spawnAgentError: (message: string): Promise<string> => ipcRenderer.invoke(ipcChannels.agentSpawnError, message),
+  closeAgent: (agentId: string): Promise<void> => ipcRenderer.invoke(ipcChannels.agentClose, agentId),
+  getWindowContext: (): Promise<WindowContext | undefined> => ipcRenderer.invoke(ipcChannels.windowGetContext),
+  followUp: (agentId: string, request: VoiceTurnRequest): Promise<void> => ipcRenderer.invoke(ipcChannels.agentFollowUp, agentId, request),
+  runAgentAction: (action: AgentAction): Promise<void> => ipcRenderer.invoke(ipcChannels.agentRunAction, action),
+  onRecordingStart: (callback: () => void) => listen(ipcChannels.recordingStart, callback),
   onChatChunk: (callback: (text: string) => void) => listen(ipcChannels.chatChunk, callback),
   onChatDone: (callback: () => void) => listen(ipcChannels.chatDone, callback),
   onChatError: (callback: (error: string) => void) => listen(ipcChannels.chatError, callback),
   onTtsAudio: (callback: (audio: ArrayBuffer) => void) => listen(ipcChannels.ttsAudio, callback),
-  onTtsError: (callback: (error: string) => void) => listen(ipcChannels.ttsError, callback)
+  onTtsError: (callback: (error: string) => void) => listen(ipcChannels.ttsError, callback),
+  onAgentUpdate: (callback: (state: AgentState) => void) => listen(ipcChannels.agentUpdate, callback),
+  onAgentCommandFlash: (callback: (command: string) => void) => listen(ipcChannels.agentCommandFlash, callback),
+  executeShell: (cmd: string): Promise<ShellResult> => ipcRenderer.invoke(ipcChannels.executeShell, cmd)
 };
 
 contextBridge.exposeInMainWorld('clicky', api);

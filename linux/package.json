@@ -15,15 +15,19 @@
     "clean": "rm -rf dist",
     "build": "npm run clean && tsc -p tsconfig.json && vite build && vite build --config vite.main.config.ts && vite build --config vite.preload.config.ts && electron-builder --linux AppImage deb",
     "build:app": "npm run clean && tsc -p tsconfig.json && vite build && vite build --config vite.main.config.ts && vite build --config vite.preload.config.ts",
+    "setup:vosk-model": "bash scripts/download-vosk-model.sh",
     "smoke:packaged": "bash scripts/smoke-packaged-renderer.sh",
     "test": "vitest run"
   },
-  "dependencies": {},
+  "dependencies": {
+    "node-record-lpcm16": "^1.0.1",
+    "vosk": "^0.3.39"
+  },
   "devDependencies": {
-    "@vitejs/plugin-react": "^5.0.0",
     "@types/node": "^22.0.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^5.0.0",
     "electron": "^37.0.0",
     "electron-builder": "^26.0.0",
     "react": "^19.0.0",
@@ -39,6 +43,7 @@
       "dist/main/**/*",
       "dist/preload/**/*",
       "dist/renderer/**/*",
+      "models/**/*",
       "package.json"
     ],
     "linux": {

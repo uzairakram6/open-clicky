@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { buildChatPayload, WorkerApi } from './workerApi';
+import { buildChatPayload, executeBashTool, WorkerApi } from './workerApi';
 
 describe('Worker request payloads', () => {
   afterEach(() => {
@@ -18,7 +18,8 @@ describe('Worker request payloads', () => {
       transcript: 'what is on screen?',
       captures: [{ jpegBase64: 'abc', label: 'selected Linux screen', width: 1280, height: 720 }],
       model: 'claude-3-5-sonnet-latest',
-      conversationHistory: [{ role: 'user', content: 'previous' }]
+      conversationHistory: [{ role: 'user', content: 'previous' }],
+      tools: [executeBashTool]
     });
   });
 

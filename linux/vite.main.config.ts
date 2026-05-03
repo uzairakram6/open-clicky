@@ -11,7 +11,14 @@ export default defineConfig({
       fileName: () => 'main.js'
     },
     rollupOptions: {
-      external: ['electron', 'electron-squirrel-startup', ...builtinModules, ...builtinModules.map((name) => `node:${name}`)]
+      external: [
+        'electron',
+        'electron-squirrel-startup',
+        'node-record-lpcm16',
+        'vosk',
+        ...builtinModules,
+        ...builtinModules.map((name) => `node:${name}`)
+      ]
     }
   }
 });

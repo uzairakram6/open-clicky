@@ -62,7 +62,7 @@ export function parseSseLine(line: string): ChatStreamEvent | undefined {
   }
 
   try {
-    const parsed = JSON.parse(payload) as { type?: string; text?: string; delta?: string; error?: string };
+    const parsed = JSON.parse(payload) as { type?: string; text?: string; delta?: string; error?: string; name?: string; arguments?: string };
 
     if (parsed.error) {
       return { type: 'error', error: parsed.error };
@@ -70,6 +70,10 @@ export function parseSseLine(line: string): ChatStreamEvent | undefined {
 
     if (parsed.type === 'done') {
       return { type: 'done' };
+    }
+
+    if (parsed.type === 'tool_call' && parsed.name) {
+      return { type: 'tool_call', name: parsed.name, arguments: parsed.arguments };
     }
 
     const text = parsed.text ?? parsed.delta;

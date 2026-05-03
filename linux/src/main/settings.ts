@@ -6,7 +6,6 @@ import type { AppSettings } from '../shared/types';
 const defaults: AppSettings = {
   workerBaseUrl: 'http://127.0.0.1:8787',
   model: 'claude-3-5-sonnet-latest',
-  shortcut: 'Control+Alt+Space',
   onboarded: false
 };
 
@@ -21,13 +20,12 @@ export async function loadSettings(): Promise<AppSettings> {
 
 export async function saveSettings(settings: AppSettings): Promise<AppSettings> {
   await mkdir(app.getPath('userData'), { recursive: true });
-  const sanitized: AppSettings = {
-    workerBaseUrl: settings.workerBaseUrl,
-    model: settings.model,
-    shortcut: settings.shortcut,
-    selectedCaptureSourceId: settings.selectedCaptureSourceId,
-    selectedCaptureSourceLabel: settings.selectedCaptureSourceLabel,
-    onboarded: settings.onboarded
+    const sanitized: AppSettings = {
+      workerBaseUrl: settings.workerBaseUrl,
+      model: settings.model,
+      selectedCaptureSourceId: settings.selectedCaptureSourceId,
+      selectedCaptureSourceLabel: settings.selectedCaptureSourceLabel,
+      onboarded: settings.onboarded
   };
   await writeFile(settingsPath(), JSON.stringify(sanitized, null, 2));
   return sanitized;

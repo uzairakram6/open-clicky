@@ -1,0 +1,42 @@
+Phase 1: The Trigger & Input (Ambient UX)
+The philosophy: The app should not exist until you need it. There is no main window, no dock icon to click, and no text box to focus on.
+The Trigger: The user initiates Clicky hands-free (presumably via a global hotkey or wake word).
+The "Listening Orb" (Cursor-Anchored UI): When triggered, Clicky does not open a menu. Instead, a tiny, minimalist UI pops up exactly where the user's mouse cursor is currently resting.
+Visuals: It looks like a small blue pill or floating orb containing animated white audio waveforms.
+UX Purpose: This is a brilliant UX choice. Since the user's eyes are already looking at whatever their cursor is pointing at, putting the listening indicator right there prevents them from having to look away to a corner of the screen.
+Voice-First Input (STT): The user speaks their command naturally out loud. Clicky transcribes this in the background. There is zero typing involved in the primary workflow.
+Phase 2: Context Gathering ("Screen Vision")
+The philosophy: The user should never have to copy/paste text or explain what they are looking at.
+Zero-Friction Context: In the video, the user says, "This is my landing page, you can see it..."
+Background UX: When the listening orb is triggered, Clicky silently takes a screenshot of the active window/monitor. It passes this image to the vision-capable LLM along with the voice prompt. The UX feels magical because the AI instantly understands the visual context of the user's screen without any manual file uploads.
+Phase 3: Execution & Feedback (The "Agent Widget" UI)
+The philosophy: Every task gets its own dedicated "digital worker."
+The Spawning Mechanic: Once the voice command is finished, the blue listening orb disappears. Instantly, a new, independent window spawns on the right side of the screen. The creator calls these "Agents."
+Widget Aesthetics:
+Frameless (no minimize/close/title bar).
+Translucent, dark-mode styling (blur backdrop).
+Rounded corners to match modern OS design.
+Live Transparency (Trust UX): While the agent is working, it does not just show a loading spinner. It actively builds trust by showing the user what it is doing.
+It displays a title of the task (e.g., ORGANIZING DESKTOP SCREENS...).
+It shows a pulsing Running badge.
+Crucial UI Detail: It flashes the actual code or terminal commands it is executing line-by-line in a small monospace font (e.g., showing ls -l or sed). The user can watch the AI interact with their computer in real-time.
+Phase 4: Completion & Handoff
+The philosophy: Don't just generate text; do the final mile of the work and give the user actionable shortcuts.
+State Change: When the backend finishes, the widget updates instantly. The pulsing "Running" state changes to a solid green "Done" badge.
+Concise Summary: It provides a 1-to-2 sentence summary of the completed task (e.g., "Your desktop screenshots are cleaned up and moved."). It does not output long, chatty AI paragraphs.
+Action Buttons (Dynamic UI): Based on the task, the widget generates context-specific UI buttons.
+If it made a reminder, it shows an "Open Reminders" button.
+If it built an app, it shows an "Open the app folder" button.
+UX Purpose: The user doesn't have to go digging through their file system to find what the AI just made.
+Phase 5: Iteration (The Follow-up Loop)
+The philosophy: AI rarely gets it perfect on the first try, or you might want to expand on the idea. Context shouldn't be lost.
+The Footer UI: At the bottom of every completed Agent Widget, there is a "Follow up" section containing two pills: [ Text ] and [ Voice ].
+Stateful UX: If the user clicks "Voice" on a specific widget (like the newly built Spotify app), they don't have to re-explain the whole app. They just say, "Make the background red."
+That specific agent goes back into the "Running" state, executes the change, and updates the app.
+Phase 6: Multi-Tasking (The Agent Tray)
+The philosophy: You can have multiple digital workers doing different things simultaneously without them blocking your computer.
+At the end of the video, we see an overlay on the right side of the screen containing a vertical list of multiple widgets.
+Asynchronous UX: The user spawned a task to clean the desktop, a task to set a reminder, a task to scrape the web, and a task to code an app—all within a couple of minutes.
+Some were "Done" and some were "Running" at the same time. The user just kept working while Clicky handled the background processes.
+Summary of the "Vibe"
+Clicky is built to feel like an incredibly fast, highly capable invisible intern. It listens when called, understands what you are pointing at, goes off to a corner of your screen to do the work, transparently shows you how it's doing it, and then hands you the finished file with a button to open it.

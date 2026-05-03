@@ -33,4 +33,12 @@ describe('SSE parser', () => {
       }
     }).rejects.toBeInstanceOf(HttpStreamError);
   });
+
+  it('parses tool_call events', () => {
+    expect(parseSseLine('data: {"type":"tool_call","name":"execute_bash_command","arguments":"{\\"command\\":\\"ls -la\\"}"}')).toEqual({
+      type: 'tool_call',
+      name: 'execute_bash_command',
+      arguments: '{"command":"ls -la"}'
+    });
+  });
 });

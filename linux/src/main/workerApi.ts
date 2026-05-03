@@ -1,17 +1,37 @@
 import { stripPointTags } from '../shared/pointTags';
-import type { ChatStreamEvent, TranscribeTokenResponse, VoiceTurnRequest } from '../shared/types';
+import type { ChatStreamEvent, LlmTool, TranscribeTokenResponse, VoiceTurnRequest } from '../shared/types';
 import { parseSseResponse } from './sse';
 
 export interface WorkerApiConfig {
   workerBaseUrl: string;
 }
 
+export const executeBashTool: LlmTool = {
+  type: 'function',
+  function: {
+    name: 'execute_bash_command',
+    description:
+      'You are an AI desktop agent on a Linux machine. You can use the execute_bash_command tool to organize files, create directories, and manage the OS. Always use absolute paths (e.g., ~/Desktop). Execute a bash/shell command on the local machine.',
+    parameters: {
+      type: 'object',
+      properties: {
+        command: {
+          type: 'string',
+          description: 'The bash command to execute. Use absolute paths like ~/Desktop/...'
+        }
+      },
+      required: ['command']
+    }
+  }
+};
+
 export function buildChatPayload(request: VoiceTurnRequest) {
   return {
     transcript: request.transcript,
     captures: request.captures,
     model: request.model,
-    conversationHistory: request.conversationHistory
+    conversationHistory: request.conversationHistory,
+    tools: [executeBashTool]
   };
 }
 

@@ -22,8 +22,8 @@ cleanup() {
 trap cleanup EXIT
 
 connected=0
-for _ in {1..20}; do
-  if agent-browser --session "$session" connect "$port" >/dev/null 2>&1; then
+for _ in {1..40}; do
+  if curl -fsS "http://127.0.0.1:$port/json/version" >/dev/null 2>&1; then
     connected=1
     break
   fi
@@ -36,16 +36,23 @@ if [[ "$connected" != "1" ]]; then
   exit 1
 fi
 
-agent-browser --session "$session" wait 2000 >/dev/null
+sleep 1
+if ! kill -0 "$pid" >/dev/null 2>&1; then
+  echo "Packaged app exited during startup" >&2
+  cat /tmp/clicky-smoke.log >&2 || true
+  exit 1
+fi
 
-body="$(agent-browser --session "$session" eval "document.body.innerText")"
+if ! grep -q "\[clicky:main\] app init started" /tmp/clicky-smoke.log; then
+  echo "Packaged app did not reach main-process initialization" >&2
+  cat /tmp/clicky-smoke.log >&2 || true
+  exit 1
+fi
 
-for expected in "Clicky" "Record" "Worker URL" "Screens" "Transcript"; do
-  if [[ "$body" != *"$expected"* ]]; then
-    echo "Packaged renderer did not expose expected text: $expected" >&2
-    echo "$body" >&2
-    exit 1
-  fi
-done
+if ! grep -Eq "\[clicky:wake\] (local wake-word listener started|wake word listener not started)" /tmp/clicky-smoke.log; then
+  echo "Packaged app did not initialize or report wake-word listener state" >&2
+  cat /tmp/clicky-smoke.log >&2 || true
+  exit 1
+fi
 
 echo "Packaged renderer smoke test passed."
