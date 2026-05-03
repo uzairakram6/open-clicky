@@ -1,0 +1,53 @@
+{
+  "name": "linux-clicky",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Linux Electron client for Clicky voice assistant",
+  "homepage": "https://example.com/clicky",
+  "author": {
+    "name": "Clicky",
+    "email": "maintainers@example.com"
+  },
+  "main": "dist/main/main.js",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "clean": "rm -rf dist",
+    "build": "npm run clean && tsc -p tsconfig.json && vite build && vite build --config vite.main.config.ts && vite build --config vite.preload.config.ts && electron-builder --linux AppImage deb",
+    "build:app": "npm run clean && tsc -p tsconfig.json && vite build && vite build --config vite.main.config.ts && vite build --config vite.preload.config.ts",
+    "smoke:packaged": "bash scripts/smoke-packaged-renderer.sh",
+    "test": "vitest run"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@vitejs/plugin-react": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "electron": "^37.0.0",
+    "electron-builder": "^26.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "typescript": "^5.8.0",
+    "vite": "^7.0.0",
+    "vitest": "^3.0.0"
+  },
+  "build": {
+    "appId": "com.clicky.linux",
+    "productName": "Clicky",
+    "files": [
+      "dist/main/**/*",
+      "dist/preload/**/*",
+      "dist/renderer/**/*",
+      "package.json"
+    ],
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "category": "Utility",
+      "maintainer": "Clicky <maintainers@example.com>"
+    }
+  }
+}
