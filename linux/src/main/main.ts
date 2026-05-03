@@ -168,8 +168,13 @@ function createOrbWindow(): void {
     if (!win.isDestroyed()) {
       win.show();
       recorderWindowReady = true;
-      safeSend(win, ipcChannels.recordingStart);
-      console.log('[clicky:orb] window shown and recording start sent');
+      // Delay the start message so React has time to mount and register IPC listeners
+      setTimeout(() => {
+        if (!win.isDestroyed()) {
+          safeSend(win, ipcChannels.recordingStart);
+          console.log('[clicky:orb] window shown and recording start sent');
+        }
+      }, 300);
     }
   }).catch((err) => {
     console.error('[clicky:orb] renderer load failed:', err);

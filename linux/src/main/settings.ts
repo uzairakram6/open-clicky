@@ -5,7 +5,7 @@ import type { AppSettings } from '../shared/types';
 
 const defaults: AppSettings = {
   workerBaseUrl: 'http://127.0.0.1:8787',
-  model: 'claude-3-5-sonnet-latest',
+  model: 'gpt-5.4-mini',
   onboarded: false
 };
 
