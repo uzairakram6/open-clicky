@@ -20,6 +20,7 @@ const api = {
   followUp: (agentId: string, request: VoiceTurnRequest): Promise<void> => ipcRenderer.invoke(ipcChannels.agentFollowUp, agentId, request),
   runAgentAction: (action: AgentAction): Promise<void> => ipcRenderer.invoke(ipcChannels.agentRunAction, action),
   onRecordingStart: (callback: () => void) => listen(ipcChannels.recordingStart, callback),
+  onRecordingStop: (callback: () => void) => listen(ipcChannels.recordingStop, callback),
   onChatChunk: (callback: (text: string) => void) => listen(ipcChannels.chatChunk, callback),
   onChatDone: (callback: () => void) => listen(ipcChannels.chatDone, callback),
   onChatError: (callback: (error: string) => void) => listen(ipcChannels.chatError, callback),

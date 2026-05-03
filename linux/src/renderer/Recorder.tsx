@@ -17,12 +17,21 @@ export function Recorder() {
   });
 
   useEffect(() => {
-    console.log('[clicky:orb] Recorder mounted and waiting for wake-word recording start');
-    const dispose = window.clicky.onRecordingStart(() => {
+    console.log('[clicky:orb] Recorder mounted and waiting for push-to-talk recording start');
+    const disposeStart = window.clicky.onRecordingStart(() => {
       console.log('[clicky:orb] recording start received', { isRecording: isRecordingRef.current });
       void startCommandRecording();
     });
-    return dispose;
+    const disposeStop = window.clicky.onRecordingStop(() => {
+      console.log('[clicky:orb] recording stop received', { isRecording: isRecordingRef.current });
+      if (isRecordingRef.current) {
+        void stopAndHandoff('hotkey-release');
+      }
+    });
+    return () => {
+      disposeStart();
+      disposeStop();
+    };
   }, []);
 
   async function stopAndHandoff(reason: string) {

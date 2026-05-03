@@ -9,6 +9,7 @@ export const ipcChannels = {
   transcribeGetToken: 'transcribe:getToken',
   ttsSpeak: 'tts:speak',
   recordingStart: 'recording:start',
+  recordingStop: 'recording:stop',
   chatChunk: 'chat:chunk',
   chatDone: 'chat:done',
   chatError: 'chat:error',

@@ -1,6 +1,4 @@
-import { app, BrowserWindow, desktopCapturer, ipcMain, Menu, nativeImage, screen, session, shell, Tray } from 'electron';
-import { createRequire } from 'node:module';
-import { existsSync, readdirSync } from 'node:fs';
+import { app, BrowserWindow, desktopCapturer, globalShortcut, ipcMain, Menu, nativeImage, screen, session, shell, Tray } from 'electron';
 import { readFile, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -14,8 +12,6 @@ import { ipcChannels } from '../shared/ipcChannels';
 import type { AppSettings, CaptureSource, VoiceTurnRequest, AgentState, WindowContext, AgentAction, ScreenCapturePayload, ShellResult, RecordedAudioPayload } from '../shared/types';
 
 const execAsync = promisify(exec);
-const require = createRequire(import.meta.url);
-let wakeRuntime: WakeRuntime | undefined;
 
 process.on('uncaughtException', (err) => {
   console.error('Uncaught Exception:', err);
@@ -32,44 +28,8 @@ let tray: Tray | undefined;
 let settings: AppSettings;
 let recorderWindow: BrowserWindow | undefined;
 let recorderWindowReady = false;
-let wakeWordService: WakeWordService | undefined;
 const agents = new Map<string, { window: BrowserWindow; state: AgentState }>();
 const windowContexts = new Map<number, WindowContext>();
-const DEFAULT_VOSK_MODEL_DIR = 'vosk-model-small-en-us';
-const DEFAULT_VOSK_MODEL_URL = 'https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip';
-
-interface NodeRecordLpcm16Module {
-  record(options: {
-    sampleRateHertz: number;
-    threshold: number;
-    verbose: boolean;
-    recordProgram?: string;
-    device?: string;
-    channels?: number;
-    audioType?: string;
-    endOnSilence?: boolean;
-  }): {
-    stream(): NodeJS.ReadableStream;
-    stop(): void;
-  };
-}
-
-interface WakeRuntime {
-  vosk: typeof import('vosk');
-  record: NodeRecordLpcm16Module;
-}
-
-function getWakeRuntime(): WakeRuntime {
-  if (wakeRuntime) {
-    return wakeRuntime;
-  }
-
-  wakeRuntime = {
-    vosk: require('vosk') as typeof import('vosk'),
-    record: require('node-record-lpcm16') as NodeRecordLpcm16Module
-  };
-  return wakeRuntime;
-}
 
 function safeSend(win: BrowserWindow | undefined, channel: string, ...args: unknown[]): void {
   if (win && !win.isDestroyed()) {
@@ -107,7 +67,7 @@ async function initApp(): Promise<void> {
   }, { useSystemPicker: true });
 
   createTray();
-  startWakeWordListener();
+  registerPushToTalkShortcut();
 }
 
 function createTray(): void {
@@ -118,7 +78,7 @@ function createTray(): void {
       tray = new Tray(icon);
     if (!tray.isDestroyed()) {
       tray.setToolTip('Clicky');
-      tray.on('click', () => console.log('[clicky:tray] tray clicked; app is wake-word triggered only'));
+      tray.on('click', () => console.log('[clicky:tray] tray clicked; app is push-to-talk triggered'));
       updateTrayMenu();
       console.log('[clicky:tray] tray created');
     }
@@ -133,7 +93,7 @@ function updateTrayMenu(): void {
   try {
     tray.setContextMenu(Menu.buildFromTemplate([
       { label: 'Settings', click: () => console.log('Settings not yet implemented') },
-      { label: 'Restart Wake Listener', click: startWakeWordListener },
+      { label: 'Start Recording', click: openRecorderOrb },
       { type: 'separator' },
       { label: 'Quit', click: () => app.quit() }
     ]));
@@ -142,17 +102,17 @@ function updateTrayMenu(): void {
   }
 }
 
-function handleWakeWordDetected(keywordLabel: string): void {
-  console.log('[clicky:wake] wake word detected; opening recorder orb', { keywordLabel });
+function openRecorderOrb(): void {
+  console.log('[clicky:hotkey] push-to-talk triggered; opening recorder orb');
   if (recorderWindow && !recorderWindow.isDestroyed()) {
-    console.warn('[clicky:wake] recorder orb is already open; ignoring wake event');
+    console.warn('[clicky:hotkey] recorder orb is already open; ignoring hotkey');
     return;
   }
   recorderWindowReady = false;
-  createOrbWindow(keywordLabel);
+  createOrbWindow();
 }
 
-function createOrbWindow(keywordLabel: string): void {
+function createOrbWindow(): void {
   const cursor = screen.getCursorScreenPoint();
   const display = screen.getDisplayNearestPoint(cursor);
   const size = 120;
@@ -209,11 +169,10 @@ function createOrbWindow(keywordLabel: string): void {
       win.show();
       recorderWindowReady = true;
       safeSend(win, ipcChannels.recordingStart);
-      console.log('[clicky:orb] window shown and recording start sent', { keywordLabel });
+      console.log('[clicky:orb] window shown and recording start sent');
     }
   }).catch((err) => {
     console.error('[clicky:orb] renderer load failed:', err);
-    wakeWordService?.resume();
   });
 
   win.on('closed', () => {
@@ -221,7 +180,6 @@ function createOrbWindow(keywordLabel: string): void {
     recorderWindow = undefined;
     recorderWindowReady = false;
     console.log('[clicky:orb] window closed and context removed', { winId });
-    wakeWordService?.resume();
   });
 }
 
@@ -431,258 +389,30 @@ function extensionForMimeType(mimeType: string): string {
   return '.webm';
 }
 
-function startWakeWordListener(): void {
-  try {
-    wakeWordService?.stop();
-    const config = getWakeWordConfig();
-    if (!config) return;
-    wakeWordService = new WakeWordService(config, handleWakeWordDetected);
-    void wakeWordService.start();
-  } catch (err) {
-    console.error('[clicky:wake] wake listener failed to start', err);
-  }
-}
-
-interface WakeWordConfig {
-  modelPath: string;
-  sampleRate: number;
-  recordProgram?: string;
-  device?: string;
-  wakePhrases: string[];
-  debounceMs: number;
-}
-
-function getWakeWordConfig(): WakeWordConfig | undefined {
-  const modelPath = resolveVoskModelPath();
-  if (!modelPath) {
-    console.warn('[clicky:wake] wake word listener not started; download the Vosk model first.');
-    console.warn('[clicky:wake] expected model directory name', {
-      modelDir: DEFAULT_VOSK_MODEL_DIR,
-      script: 'npm run setup:vosk-model',
-      url: DEFAULT_VOSK_MODEL_URL
-    });
-    return undefined;
-  }
-  const wakePhrases = splitEnvList(process.env.CLICKY_WAKE_PHRASES);
-  const normalizedWakePhrases = wakePhrases.length > 0 ? wakePhrases : ['hey clicky', 'clicky'];
-  const sampleRate = Number.parseInt(process.env.CLICKY_WAKE_SAMPLE_RATE ?? '16000', 10);
-  const debounceMs = Number.parseInt(process.env.CLICKY_WAKE_DEBOUNCE_MS ?? '2500', 10);
-  const recordProgram = process.env.CLICKY_WAKE_RECORD_PROGRAM ?? (process.platform === 'linux' ? 'arecord' : undefined);
-  const device = process.env.CLICKY_WAKE_DEVICE?.trim() || undefined;
-  console.log('[clicky:wake] wake word config loaded', {
-    modelPath,
-    sampleRate,
-    recordProgram,
-    device,
-    wakePhrases: normalizedWakePhrases,
-    debounceMs
-  });
-  return {
-    modelPath,
-    sampleRate: Number.isFinite(sampleRate) ? sampleRate : 16000,
-    recordProgram,
-    device,
-    wakePhrases: normalizedWakePhrases.map((item) => item.toLowerCase()),
-    debounceMs: Number.isFinite(debounceMs) ? debounceMs : 2500
-  };
-}
-
 function splitEnvList(value: string | undefined): string[] {
   return value?.split(',')
     .map((item) => item.trim())
     .filter(Boolean) ?? [];
 }
 
-function resolveVoskModelPath(): string | undefined {
-  const configured = process.env.CLICKY_VOSK_MODEL_PATH?.trim();
-  const candidateRoots = [
-    configured,
-    join(process.cwd(), 'models', DEFAULT_VOSK_MODEL_DIR),
-    join(app.getAppPath(), 'models', DEFAULT_VOSK_MODEL_DIR),
-    join(process.resourcesPath, 'models', DEFAULT_VOSK_MODEL_DIR)
-  ].filter((value): value is string => Boolean(value));
-
-  for (const candidate of candidateRoots) {
-    if (existsSync(candidate)) {
-      return candidate;
-    }
-  }
-
-  const rootDirectories = [
-    join(process.cwd(), 'models'),
-    join(app.getAppPath(), 'models'),
-    join(process.resourcesPath, 'models')
-  ];
-  for (const root of rootDirectories) {
-    try {
-      const match = readdirSync(root)
-        .find((entry) => entry.startsWith('vosk-model-small-en-us'));
-      if (match) {
-        return join(root, match);
+function registerPushToTalkShortcut(): void {
+  const shortcut = process.env.CLICKY_HOTKEY ?? 'Control+Alt+Space';
+  const registered = globalShortcut.register(shortcut, () => {
+    if (recorderWindow && !recorderWindow.isDestroyed()) {
+      if (recorderWindowReady) {
+        safeSend(recorderWindow, ipcChannels.recordingStop);
+        console.log('[clicky:hotkey] stop recording sent to orb');
       }
-    } catch {
-      void 0;
+    } else {
+      openRecorderOrb();
     }
+  });
+
+  if (registered) {
+    console.log('[clicky:hotkey] global shortcut registered', { shortcut });
+  } else {
+    console.error('[clicky:hotkey] failed to register global shortcut', { shortcut });
   }
-
-  return undefined;
-}
-
-function extractTranscript(payload: unknown): string {
-  if (!payload) return '';
-
-  if (typeof payload === 'string') {
-    try {
-      return extractTranscript(JSON.parse(payload));
-    } catch {
-      return payload;
-    }
-  }
-
-  if (typeof payload === 'object') {
-    const candidate = payload as { text?: unknown; partial?: unknown };
-    if (typeof candidate.text === 'string') return candidate.text;
-    if (typeof candidate.partial === 'string') return candidate.partial;
-  }
-
-  return '';
-}
-
-class WakeWordService {
-  private runtime?: WakeRuntime;
-  private model?: import('vosk').Model;
-  private recognizer?: import('vosk').Recognizer;
-  private recorder?: ReturnType<NodeRecordLpcm16Module['record']>;
-  private audioStream?: NodeJS.ReadableStream;
-  private running = false;
-  private listening = false;
-  private lastWakeAt = 0;
-
-  constructor(
-    private readonly config: WakeWordConfig,
-    private readonly onWake: (keywordLabel: string) => void
-  ) {}
-
-  async start(): Promise<void> {
-    if (this.running) return;
-    console.log('[clicky:wake] initializing local Vosk wake-word listener');
-    this.runtime = getWakeRuntime();
-    this.runtime.vosk.setLogLevel(0);
-    this.model = new this.runtime.vosk.Model(this.config.modelPath);
-    this.running = true;
-    this.resume();
-  }
-
-  stop(): void {
-    this.running = false;
-    this.stopCapture();
-    try {
-      this.recognizer?.free();
-    } catch {
-      void 0;
-    }
-    try {
-      this.model?.free();
-    } catch {
-      void 0;
-    }
-    this.recognizer = undefined;
-    this.model = undefined;
-    console.log('[clicky:wake] local wake-word listener stopped');
-  }
-
-  resume(): void {
-    if (!this.running || this.listening || !this.model || !this.runtime) return;
-    this.recognizer = new this.runtime.vosk.Recognizer({ model: this.model, sampleRate: this.config.sampleRate });
-    this.recorder = this.runtime.record.record({
-      sampleRateHertz: this.config.sampleRate,
-      threshold: 0,
-      verbose: false,
-      recordProgram: this.config.recordProgram,
-      device: this.config.device,
-      channels: 1,
-      audioType: 'raw',
-      endOnSilence: false
-    });
-    this.audioStream = this.recorder.stream();
-    this.audioStream.on('data', this.handleAudioChunk);
-    this.audioStream.on('error', this.handleStreamError);
-    this.audioStream.on('close', this.handleStreamClose);
-    this.listening = true;
-    console.log('[clicky:wake] local wake-word listener started', {
-      sampleRate: this.config.sampleRate,
-      recordProgram: this.config.recordProgram,
-      device: this.config.device,
-      wakePhrases: this.config.wakePhrases
-    });
-  }
-
-  pause(): void {
-    if (!this.running || !this.listening) return;
-    this.stopCapture();
-    console.log('[clicky:wake] local wake-word listener paused');
-  }
-
-  private stopCapture(): void {
-    this.audioStream?.off('data', this.handleAudioChunk);
-    this.audioStream?.off('error', this.handleStreamError);
-    this.audioStream?.off('close', this.handleStreamClose);
-    this.audioStream = undefined;
-    try {
-      this.recorder?.stop();
-    } catch {
-      void 0;
-    }
-    this.recorder = undefined;
-    try {
-      this.recognizer?.free();
-    } catch {
-      void 0;
-    }
-    this.recognizer = undefined;
-    this.listening = false;
-  }
-
-  private readonly handleAudioChunk = (chunk: Buffer): void => {
-    if (!this.running || !this.listening || !this.recognizer) return;
-    try {
-      const accepted = this.recognizer.acceptWaveform(chunk);
-      const transcript = extractTranscript(accepted ? this.recognizer.result() : this.recognizer.partialResult())
-        .trim()
-        .toLowerCase();
-      if (!transcript) return;
-
-      const matchedPhrase = this.config.wakePhrases.find((phrase) => transcript.includes(phrase));
-      if (!matchedPhrase) return;
-
-      const now = Date.now();
-      if (now - this.lastWakeAt < this.config.debounceMs) {
-        return;
-      }
-
-      this.lastWakeAt = now;
-      console.log('[clicky:wake] local wake phrase matched', {
-        transcript,
-        matchedPhrase
-      });
-      this.pause();
-      this.onWake(matchedPhrase);
-    } catch (err) {
-      console.error('[clicky:wake] wake listener chunk processing failed', err);
-      this.pause();
-    }
-  };
-
-  private readonly handleStreamError = (err: unknown): void => {
-    console.error('[clicky:wake] wake listener stream failed', err);
-    this.pause();
-  };
-
-  private readonly handleStreamClose = (): void => {
-    if (!this.running || !this.listening) return;
-    console.warn('[clicky:wake] wake listener stream closed unexpectedly');
-    this.pause();
-  };
 }
 
 async function executeShellCommand(command: string): Promise<ShellResult> {
@@ -922,7 +652,6 @@ ipcMain.handle(ipcChannels.agentSpawn, async (_event, request: VoiceTurnRequest)
 
   agents.set(agentId, { window: win, state });
   console.log('[clicky:agent] state stored', { agentId });
-  wakeWordService?.resume();
 
   win.webContents.on('did-finish-load', () => {
     console.log('[clicky:agent] renderer loaded; sending initial state', { agentId });
@@ -946,7 +675,6 @@ ipcMain.handle(ipcChannels.agentSpawn, async (_event, request: VoiceTurnRequest)
 
 ipcMain.handle(ipcChannels.agentSpawnError, (_event, message: string): string => {
   console.log('[clicky:agent] spawn error requested', { message });
-  wakeWordService?.resume();
   return createErrorAgent(message);
 });
 
@@ -1027,7 +755,8 @@ ipcMain.handle(ipcChannels.agentFollowUp, async (_event, agentId: string, reques
 
 app.whenReady().then(initApp);
 app.on('will-quit', () => {
-  wakeWordService?.stop();
+  globalShortcut.unregisterAll();
+  console.log('[clicky:hotkey] global shortcuts unregistered');
 });
 app.on('window-all-closed', () => {
   void 0;

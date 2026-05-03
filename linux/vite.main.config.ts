@@ -14,8 +14,7 @@ export default defineConfig({
       external: [
         'electron',
         'electron-squirrel-startup',
-        'node-record-lpcm16',
-        'vosk',
+
         ...builtinModules,
         ...builtinModules.map((name) => `node:${name}`)
       ]
