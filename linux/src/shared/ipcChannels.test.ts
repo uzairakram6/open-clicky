@@ -28,6 +28,7 @@ describe('IPC channel contract', () => {
       agentUpdate: 'agent:update',
       agentFollowUp: 'agent:followUp',
       agentRunAction: 'agent:runAction',
+      agentSetExpanded: 'agent:setExpanded',
       windowGetContext: 'window:getContext',
       executeShell: 'shell:execute',
       openUrl: 'open-url',

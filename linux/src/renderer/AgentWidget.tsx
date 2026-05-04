@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { stripPointTags } from '../shared/pointTags';
-import type { AgentState, AgentAction, ConversationMessage, ScreenCapturePayload } from '../shared/types';
+import type { AgentState, AgentAction, ScreenCapturePayload } from '../shared/types';
 import { playAudioBytes } from './playAudio';
 import { useVoiceRecorder } from './useVoiceRecorder';
 
@@ -8,15 +8,15 @@ export interface AgentWidgetProps {
   agentId: string;
 }
 
-function inferToolType(command: string, transcript: string): { icon: string; label: string } {
+function inferToolType(command: string, transcript: string): { tone: 'blue' | 'green' | 'red'; label: string } {
   const cmd = command.toLowerCase();
   const t = transcript.toLowerCase();
 
   if (cmd.includes('opening') && (cmd.includes('http') || cmd.includes('browser'))) {
-    return { icon: '\uD83C\uDF10', label: 'OPEN LINK' };
+    return { tone: 'blue', label: 'OPENING LINK' };
   }
   if (cmd.includes('scraping')) {
-    return { icon: '\uD83E\uDDFE', label: 'WEB SCRAPE' };
+    return { tone: 'blue', label: 'SCRAPING WEB' };
   }
   if (
     cmd.includes('ls') ||
@@ -36,21 +36,21 @@ function inferToolType(command: string, transcript: string): { icon: string; lab
     cmd.includes('curl') ||
     cmd.includes('wget')
   ) {
-    return { icon: '\uD83D\uDDA5\uFE0F', label: 'TERMINAL' };
+    return { tone: 'green', label: 'EXECUTING COMMAND' };
   }
   if (t.includes('search') || t.includes('google') || t.includes('find') || t.includes('look up') || t.includes('web')) {
-    return { icon: '\uD83C\uDF10', label: 'WEB SEARCH' };
+    return { tone: 'blue', label: 'SEARCHING WEB' };
   }
   if (t.includes('reminder') || t.includes('calendar') || t.includes('schedule') || t.includes('event')) {
-    return { icon: '\uD83D\uDCC5', label: 'CALENDAR' };
+    return { tone: 'red', label: 'UPDATING CALENDAR' };
   }
   if (t.includes('file') || t.includes('folder') || t.includes('desktop') || t.includes('document') || t.includes('directory')) {
-    return { icon: '\uD83D\uDCC1', label: 'FILES' };
+    return { tone: 'green', label: 'ORGANIZING FILES' };
   }
   if (t.includes('email') || t.includes('mail') || t.includes('message') || t.includes('slack')) {
-    return { icon: '\u2709\uFE0F', label: 'MESSAGES' };
+    return { tone: 'blue', label: 'CHECKING MESSAGES' };
   }
-  return { icon: '\uD83E\uDD16', label: 'AGENT' };
+  return { tone: 'green', label: 'WORKING' };
 }
 
 export function AgentWidget({ agentId }: AgentWidgetProps) {
@@ -60,6 +60,8 @@ export function AgentWidget({ agentId }: AgentWidgetProps) {
   const [flashCommand, setFlashCommand] = useState('');
   const [followUpMode, setFollowUpMode] = useState<'none' | 'text' | 'voice'>('none');
   const [followUpText, setFollowUpText] = useState('');
+  const [isTerminalVisible, setIsTerminalVisible] = useState(false);
+  const [isExpanded, setIsExpanded] = useState(false);
   const flashTimeoutRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const { transcript, level, isRecording, startRecording, stopRecording } = useVoiceRecorder();
 
@@ -101,6 +103,26 @@ export function AgentWidget({ agentId }: AgentWidgetProps) {
       }
     };
   }, [agentId]);
+
+  const status = agent?.status ?? 'running';
+  const isDone = status === 'done';
+  const isError = status === 'error';
+
+  const latestCommand = agent?.commands?.[agent.commands.length - 1] ?? '';
+  const activeCommand = flashCommand || latestCommand;
+
+  useEffect(() => {
+    if (status === 'running') {
+      if (activeCommand) {
+        setIsTerminalVisible(true);
+      }
+    } else if (status === 'done') {
+      const timer = setTimeout(() => setIsTerminalVisible(false), 300);
+      return () => clearTimeout(timer);
+    } else {
+      setIsTerminalVisible(false);
+    }
+  }, [status, activeCommand]);
 
   const handleAction = useCallback((action: AgentAction) => {
     if (action.type === 'copy' && agent?.response) {
@@ -173,85 +195,97 @@ export function AgentWidget({ agentId }: AgentWidgetProps) {
     }
   }, [submitFollowUp]);
 
-  const status = agent?.status ?? 'running';
-  const isDone = status === 'done';
-  const isError = status === 'error';
-
-  const latestCommand = agent?.commands?.[agent.commands.length - 1] ?? '';
-  const activeCommand = flashCommand || latestCommand;
   const tool = inferToolType(activeCommand, agent?.transcript ?? '');
 
-  const headerLabel = status === 'running'
-    ? `${tool.icon} ${tool.label}`
-    : (agent?.transcript ? agent.transcript.slice(0, 30) + (agent.transcript.length > 30 ? '...' : '') : 'Agent');
+  const expandWidget = useCallback(() => {
+    setIsExpanded(true);
+    void window.clicky.setAgentExpanded(agentId, true);
+  }, [agentId]);
+
+  const collapseModal = useCallback(() => {
+    if (followUpMode !== 'none') return;
+    setIsExpanded(false);
+    void window.clicky.setAgentExpanded(agentId, false);
+  }, [agentId, followUpMode]);
+
+  const modalTitle =
+    status === 'running'
+      ? tool.label
+      : (agent?.transcript?.trim() || 'Agent');
+  const modalTitleDisplay =
+    modalTitle.length > 46 ? `${modalTitle.slice(0, 45).toUpperCase()}…` : modalTitle.toUpperCase();
+
+  const statusPillLabel = isError ? 'Error' : isDone ? 'Done' : 'Working';
 
   return (
-    <div className="agent-widget">
+    <div
+      className={`agent-widget ${isExpanded ? 'expanded' : 'minimized'} ${isError ? 'status-error' : ''}`}
+    >
+      <button type="button" className="agent-mini" onClick={expandWidget} aria-label="Open agent details">
+        <span className={`mini-status ${status}`} />
+        <span className="mini-triangle" />
+      </button>
+
       <header className="agent-header">
-        <div className="agent-title">
-          <span className={`status-dot ${status}`} />
-          <span className="agent-label">{headerLabel}</span>
+        <h2 className="agent-modal-title" title={modalTitle}>
+          {modalTitleDisplay}
+        </h2>
+        <div className="agent-header-actions">
+          <span className={`status-pill ${status}`}>{statusPillLabel}</span>
+          <button type="button" className="agent-minimize" onClick={collapseModal} aria-label="Minimize">
+            <svg width="14" height="14" viewBox="0 0 24 24" aria-hidden fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+              <path d="M5 12h14" />
+            </svg>
+          </button>
+          <button type="button" className="agent-close" onClick={closeWidget} aria-label="Close agent">
+            &times;
+          </button>
         </div>
-        <button className="agent-close" onClick={closeWidget} aria-label="Close">&times;</button>
       </header>
 
-      <section className="agent-body">
-        <div className="agent-transcript">
-          <strong>Command</strong>
-          <p>{agent?.transcript ?? 'Initializing...'}</p>
-        </div>
-
-        {status === 'running' && (
-          <>
-            {activeCommand && (
-              <div className="command-flash">
-                <div className="command-label">Action Feedback</div>
-                <code>{`> ${activeCommand}`}</code>
-              </div>
-            )}
-            <div className="agent-status running">
-              <span className="status-indicator" />
-              <span>
-                {activeCommand
-                  ? (activeCommand.toLowerCase().includes('opening') && activeCommand.toLowerCase().includes('browser')
-                      ? 'Opening link in browser...'
-                      : activeCommand.toLowerCase().includes('scraping')
-                        ? 'Scraping website...'
-                        : 'Executing shell command...')
-                  : 'Running'}
-              </span>
-            </div>
-          </>
+      <section className="agent-body" aria-hidden={!isExpanded}>
+        {isDone && (agent?.summary || agent?.response) && (
+          <p className="agent-modal-lead">{agent.summary || agent.response}</p>
         )}
 
-        {response && status !== 'done' && (
-          <div className="agent-response">
-            <strong>Response</strong>
-            <p>{response}</p>
+        {isDone && agent?.transcript && (
+          <div className="agent-modal-meta">
+            <span className="modal-section-label">Request</span>
+            <p>{agent.transcript}</p>
           </div>
         )}
 
-        {isDone && (
-          <div className="agent-done">
-            <div className="done-badge">Done</div>
-            <p className="agent-summary">{agent?.summary}</p>
+        {status === 'running' && (
+          <div className="agent-transcript">
+            <span className="modal-section-label">Command</span>
+            <p>{agent?.transcript ?? 'Initializing...'}</p>
+          </div>
+        )}
+
+        {(status === 'running' || isTerminalVisible) && activeCommand && (
+          <div key={activeCommand} className={`terminal-box ${status !== 'running' ? 'fade-out' : ''}`}>
+            <span className="terminal-text">{`> ${activeCommand}`}</span>
+            <span className="cursor-blink">█</span>
           </div>
         )}
 
         {isError && (
           <div className="agent-error">
-            <strong>Error</strong>
+            <span className="modal-section-label">Error</span>
             <div className="error-badge">{error || agent?.error}</div>
           </div>
         )}
 
         {isDone && agent?.actions && agent.actions.length > 0 && (
-          <div className="agent-actions">
-            {agent.actions.map((action) => (
-              <button key={action.id} className="action-pill" onClick={() => handleAction(action)}>
-                {action.label}
-              </button>
-            ))}
+          <div className="agent-suggested">
+            <span className="modal-section-label">Suggested next</span>
+            <div className="agent-actions">
+              {agent.actions.map((action) => (
+                <button key={action.id} type="button" className="action-pill" onClick={() => handleAction(action)}>
+                  {action.label}
+                </button>
+              ))}
+            </div>
           </div>
         )}
       </section>
@@ -290,10 +324,18 @@ export function AgentWidget({ agentId }: AgentWidgetProps) {
           <div className="follow-up-section">
             <span className="follow-up-label">Follow up</span>
             <div className="follow-up-buttons-row">
-              <button className="follow-up-btn text-btn" onClick={() => setFollowUpMode('text')}>
+              <button type="button" className="follow-up-btn text-btn" onClick={() => setFollowUpMode('text')}>
+                <svg className="follow-up-btn-icon" width="16" height="16" viewBox="0 0 24 24" aria-hidden fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                  <path d="M4 7h12M4 12h8M4 17h14" />
+                  <path d="M16 3v4M18 5h-4" />
+                </svg>
                 Text
               </button>
-              <button className="follow-up-btn voice-btn" onClick={() => void startVoiceFollowUp()}>
+              <button type="button" className="follow-up-btn voice-btn" onClick={() => void startVoiceFollowUp()}>
+                <svg className="follow-up-btn-icon" width="16" height="16" viewBox="0 0 24 24" aria-hidden fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <rect x="9" y="3" width="6" height="10" rx="3" />
+                  <path d="M5 11a7 7 0 0 0 14 0M12 19v3" />
+                </svg>
                 Voice
               </button>
             </div>

@@ -28,8 +28,16 @@ let tray: Tray | undefined;
 let settings: AppSettings;
 let recorderWindow: BrowserWindow | undefined;
 let recorderWindowReady = false;
-const agents = new Map<string, { window: BrowserWindow; state: AgentState }>();
+const agents = new Map<string, { window: BrowserWindow; state: AgentState; expanded: boolean }>();
 const windowContexts = new Map<number, WindowContext>();
+const agentWindowMetrics = {
+  miniWidth: 52,
+  miniHeight: 52,
+  expandedWidth: 340,
+  expandedHeight: 420,
+  margin: 18,
+  stackGap: 10
+};
 
 function safeSend(win: BrowserWindow | undefined, channel: string, ...args: unknown[]): void {
   if (win && !win.isDestroyed()) {
@@ -194,11 +202,9 @@ function createOrbWindow(): void {
 
 function createAgentWindow(agentId: string): BrowserWindow {
   const primary = screen.getPrimaryDisplay();
-  const margin = 20;
-  const width = 380;
-  const height = 440;
+  const { miniWidth: width, miniHeight: height, margin, stackGap } = agentWindowMetrics;
   const x = primary.workArea.x + primary.workArea.width - width - margin;
-  const y = primary.workArea.y + margin + (agents.size * (height + margin));
+  const y = primary.workArea.y + margin + (agents.size * (height + stackGap));
   console.log('[clicky:agent] creating agent window', { agentId, x, y, width, height });
 
   const win = new BrowserWindow({
@@ -208,8 +214,8 @@ function createAgentWindow(agentId: string): BrowserWindow {
     y,
     frame: false,
     transparent: true,
-    backgroundColor: undefined,
-    hasShadow: true,
+    backgroundColor: '#00000000',
+    hasShadow: false,
     alwaysOnTop: true,
     skipTaskbar: true,
     resizable: false,
@@ -247,6 +253,22 @@ function createAgentWindow(agentId: string): BrowserWindow {
   return win;
 }
 
+function setAgentWindowExpanded(agentId: string, expanded: boolean): void {
+  const entry = agents.get(agentId);
+  if (!entry || entry.window.isDestroyed()) return;
+
+  entry.expanded = expanded;
+  const display = screen.getDisplayNearestPoint(entry.window.getBounds());
+  const { miniWidth, miniHeight, expandedWidth, expandedHeight, margin } = agentWindowMetrics;
+  const width = expanded ? expandedWidth : miniWidth;
+  const height = expanded ? expandedHeight : miniHeight;
+  const current = entry.window.getBounds();
+  const x = display.workArea.x + display.workArea.width - width - margin;
+  const y = Math.max(display.workArea.y + margin, current.y);
+
+  entry.window.setBounds({ x, y, width, height }, true);
+}
+
 function buildDefaultActions(transcript: string): AgentAction[] {
   const actions: AgentAction[] = [{ id: 'copy', label: 'Copy Response', type: 'copy' }];
   if (transcript.toLowerCase().includes('reminder')) {
@@ -278,7 +300,7 @@ function createErrorAgent(message: string): string {
     completedAt: Date.now()
   };
 
-  agents.set(agentId, { window: win, state });
+  agents.set(agentId, { window: win, state, expanded: false });
   win.webContents.on('did-finish-load', () => {
     console.log('[clicky:agent] sending error state to renderer', { agentId });
     safeSend(win, ipcChannels.agentUpdate, state);
@@ -906,7 +928,7 @@ ipcMain.handle(ipcChannels.agentSpawn, async (_event, request: VoiceTurnRequest)
     createdAt: Date.now()
   };
 
-  agents.set(agentId, { window: win, state });
+  agents.set(agentId, { window: win, state, expanded: false });
   console.log('[clicky:agent] state stored', { agentId });
 
   win.webContents.on('did-finish-load', () => {
@@ -954,6 +976,10 @@ ipcMain.handle(ipcChannels.agentRunAction, async (_event, action: AgentAction) =
   } else if (action.type === 'open_url' && action.payload) {
     await shell.openExternal(action.payload);
   }
+});
+
+ipcMain.handle(ipcChannels.agentSetExpanded, (_event, agentId: string, expanded: boolean) => {
+  setAgentWindowExpanded(agentId, expanded);
 });
 
 ipcMain.handle(ipcChannels.openUrl, async (_event, url: string) => {

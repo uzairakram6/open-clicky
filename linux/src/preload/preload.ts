@@ -19,6 +19,7 @@ const api = {
   getWindowContext: (): Promise<WindowContext | undefined> => ipcRenderer.invoke(ipcChannels.windowGetContext),
   followUp: (agentId: string, request: VoiceTurnRequest): Promise<void> => ipcRenderer.invoke(ipcChannels.agentFollowUp, agentId, request),
   runAgentAction: (action: AgentAction): Promise<void> => ipcRenderer.invoke(ipcChannels.agentRunAction, action),
+  setAgentExpanded: (agentId: string, expanded: boolean): Promise<void> => ipcRenderer.invoke(ipcChannels.agentSetExpanded, agentId, expanded),
   openUrl: (url: string): Promise<void> => ipcRenderer.invoke(ipcChannels.openUrl, url),
   scrapeWebsite: (url: string): Promise<string> => ipcRenderer.invoke(ipcChannels.scrapeWebsite, url),
   onRecordingStart: (callback: () => void) => listen(ipcChannels.recordingStart, callback),
