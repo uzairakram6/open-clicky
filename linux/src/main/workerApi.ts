@@ -67,13 +67,22 @@ export const scrapeWebsiteTool: LlmTool = {
   function: {
     name: 'scrape_website',
     description:
-      'Fetches and extracts readable text content from a web URL. Use this when the user asks about content on a specific website, wants to summarize a page, or needs information from a web page. Returns the extracted text content.',
+      'Fetches and extracts readable content from a web URL. Use this when the user asks about content on a specific website, wants to summarize a page, or needs information from a web page. Returns structured markdown or plain text with the page title when available.',
     parameters: {
       type: 'object',
       properties: {
         url: {
           type: 'string',
           description: 'The web URL to scrape. Must be a valid http or https URL.'
+        },
+        extractMode: {
+          type: 'string',
+          enum: ['markdown', 'text'],
+          description: 'Output format: markdown (default) preserves headings and links; text returns plain text.'
+        },
+        maxChars: {
+          type: 'number',
+          description: 'Maximum characters to return. Default 50000.'
         }
       },
       required: ['url']

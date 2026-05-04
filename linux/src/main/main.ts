@@ -1,17 +1,21 @@
 import { app, BrowserWindow, desktopCapturer, globalShortcut, ipcMain, Menu, nativeImage, screen, session, shell, Tray } from 'electron';
 import { readFile, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { exec } from 'node:child_process';
+import { exec, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { loadSettings, saveSettings } from './settings';
 import { WorkerApi } from './workerApi';
+import { scrapeWebsite } from './scraper';
 import { ipcChannels } from '../shared/ipcChannels';
 import type { AppSettings, CaptureSource, VoiceTurnRequest, AgentState, WindowContext, AgentAction, ScreenCapturePayload, ShellResult, RecordedAudioPayload } from '../shared/types';
 
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
+const TOGGLE_RECORDER_ARG = '--clicky-toggle-recorder';
+const GNOME_CLICKY_SHORTCUT_PATH = '/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/clicky-toggle/';
 
 process.on('uncaughtException', (err) => {
   console.error('Uncaught Exception:', err);
@@ -19,6 +23,15 @@ process.on('uncaughtException', (err) => {
 process.on('unhandledRejection', (err) => {
   console.error('Unhandled Rejection:', err);
 });
+
+const waylandSession = process.env.XDG_SESSION_TYPE === 'wayland' || !!process.env.WAYLAND_DISPLAY;
+if (waylandSession) {
+  process.env.ELECTRON_OZONE_PLATFORM_HINT = 'x11';
+  app.commandLine.appendSwitch('ozone-platform', 'x11');
+  app.commandLine.appendSwitch('ozone-platform-hint', 'x11');
+  app.commandLine.appendSwitch('disable-features', 'GlobalShortcutsPortal');
+  console.log('[clicky:main] detected Wayland session, forcing XWayland/X11 global shortcut backend');
+}
 
 app.commandLine.appendSwitch('no-sandbox');
 
@@ -45,12 +58,19 @@ function safeSend(win: BrowserWindow | undefined, channel: string, ...args: unkn
   }
 }
 
-app.commandLine.appendSwitch('enable-features', 'GlobalShortcutsPortal');
-
 const singleInstanceLock = app.requestSingleInstanceLock();
 if (!singleInstanceLock) {
   app.quit();
 }
+app.on('second-instance', (_event, argv) => {
+  if (argv.includes(TOGGLE_RECORDER_ARG)) {
+    if (app.isReady()) {
+      handlePushToTalkTrigger('gnome-custom-shortcut');
+    } else {
+      void app.whenReady().then(() => handlePushToTalkTrigger('gnome-custom-shortcut'));
+    }
+  }
+});
 
 async function initApp(): Promise<void> {
   console.log('[clicky:main] app init started');
@@ -77,6 +97,7 @@ async function initApp(): Promise<void> {
 
   createTray();
   registerPushToTalkShortcut();
+  void registerGnomeWaylandShortcut();
 }
 
 function createTray(): void {
@@ -119,6 +140,18 @@ function openRecorderOrb(): void {
   }
   recorderWindowReady = false;
   createOrbWindow();
+}
+
+function handlePushToTalkTrigger(source: string): void {
+  console.log('[clicky:hotkey] push-to-talk triggered', { source });
+  if (recorderWindow && !recorderWindow.isDestroyed()) {
+    if (recorderWindowReady) {
+      safeSend(recorderWindow, ipcChannels.recordingStop);
+      console.log('[clicky:hotkey] stop recording sent to orb', { source });
+    }
+    return;
+  }
+  openRecorderOrb();
 }
 
 function createOrbWindow(): void {
@@ -426,64 +459,75 @@ function splitEnvList(value: string | undefined): string[] {
     .filter(Boolean) ?? [];
 }
 
-async function scrapeWebsiteContent(url: string): Promise<string> {
-  console.log('[clicky:scrape] fetching', { url });
-  const response = await fetch(url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    }
-  });
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status} ${response.statusText}`);
-  }
-  const html = await response.text();
-  console.log('[clicky:scrape] fetched', { url, bytes: html.length });
-
-  // Remove script, style, noscript, iframe tags and their contents
-  let text = html
-    .replace(/<(script|style|noscript|iframe|nav|footer|header|aside)[\s\S]*?<\/\1>/gi, ' ')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#\d+;/g, (match) => {
-      try {
-        return String.fromCharCode(parseInt(match.slice(2, -1), 10));
-      } catch {
-        return match;
-      }
-    })
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  const maxChars = 8000;
-  if (text.length > maxChars) {
-    text = text.slice(0, maxChars) + '\n\n[Content truncated]';
-  }
-  console.log('[clicky:scrape] extracted text', { url, chars: text.length });
-  return text;
-}
-
 function registerPushToTalkShortcut(): void {
   const shortcut = process.env.CLICKY_HOTKEY ?? 'Control+Alt+Space';
-  const registered = globalShortcut.register(shortcut, () => {
-    if (recorderWindow && !recorderWindow.isDestroyed()) {
-      if (recorderWindowReady) {
-        safeSend(recorderWindow, ipcChannels.recordingStop);
-        console.log('[clicky:hotkey] stop recording sent to orb');
-      }
-    } else {
-      openRecorderOrb();
-    }
-  });
+  const registered = globalShortcut.register(shortcut, () => handlePushToTalkTrigger('electron-globalShortcut'));
 
   if (registered) {
     console.log('[clicky:hotkey] global shortcut registered', { shortcut });
   } else {
     console.error('[clicky:hotkey] failed to register global shortcut', { shortcut });
   }
+}
+
+async function registerGnomeWaylandShortcut(): Promise<void> {
+  if (!isWayland() || !isGnomeDesktop()) return;
+
+  const binding = process.env.CLICKY_GNOME_HOTKEY ?? '<Control><Alt>space';
+  const command = getToggleRecorderCommand();
+  try {
+    const currentRaw = await execFileOutput('gsettings', ['get', 'org.gnome.settings-daemon.plugins.media-keys', 'custom-keybindings']);
+    const paths = parseGSettingsStringList(currentRaw);
+    const nextPaths = paths.includes(GNOME_CLICKY_SHORTCUT_PATH) ? paths : [...paths, GNOME_CLICKY_SHORTCUT_PATH];
+
+    if (nextPaths.length !== paths.length) {
+      await execFileOutput('gsettings', ['set', 'org.gnome.settings-daemon.plugins.media-keys', 'custom-keybindings', formatGSettingsStringList(nextPaths)]);
+    }
+    await execFileOutput('gsettings', ['set', `org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:${GNOME_CLICKY_SHORTCUT_PATH}`, 'name', 'Clicky push to talk']);
+    await execFileOutput('gsettings', ['set', `org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:${GNOME_CLICKY_SHORTCUT_PATH}`, 'command', command]);
+    await execFileOutput('gsettings', ['set', `org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:${GNOME_CLICKY_SHORTCUT_PATH}`, 'binding', binding]);
+    console.log('[clicky:hotkey] GNOME Wayland shortcut registered', { binding, command });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.warn('[clicky:hotkey] GNOME Wayland shortcut registration failed', { message });
+  }
+}
+
+function isGnomeDesktop(): boolean {
+  const desktop = `${process.env.XDG_CURRENT_DESKTOP ?? ''}:${process.env.DESKTOP_SESSION ?? ''}`.toLowerCase();
+  return desktop.includes('gnome') || desktop.includes('ubuntu');
+}
+
+function getToggleRecorderCommand(): string {
+  const executable = process.execPath;
+  if (app.isPackaged) {
+    return `${executable} ${TOGGLE_RECORDER_ARG}`;
+  }
+
+  const entry = process.argv.find((arg, index) => index > 0 && !arg.startsWith('-'));
+  const entryPath = entry ? (isAbsolute(entry) ? entry : resolve(process.cwd(), entry)) : undefined;
+  return entry
+    ? `${executable} ${entryPath} ${TOGGLE_RECORDER_ARG}`
+    : `${executable} ${TOGGLE_RECORDER_ARG}`;
+}
+
+async function execFileOutput(file: string, args: string[]): Promise<string> {
+  const { stdout } = await execFileAsync(file, args);
+  return stdout.trim();
+}
+
+function parseGSettingsStringList(value: string): string[] {
+  const paths: string[] = [];
+  const re = /'([^']+)'/g;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(value)) !== null) {
+    paths.push(match[1]);
+  }
+  return paths;
+}
+
+function formatGSettingsStringList(paths: string[]): string {
+  return `[${paths.map((path) => `'${path.replace(/'/g, `\\'`)}'`).join(', ')}]`;
 }
 
 async function executeShellCommand(command: string): Promise<ShellResult> {
@@ -666,9 +710,9 @@ async function processAgentStream(
       }
     } else if (event.type === 'tool_call' && event.name === 'scrape_website') {
       console.log('[clicky:agent] TOOL_CALL scrape_website RECEIVED', { agentId, args: event.arguments });
-      let args: { url?: string } = {};
+      let args: { url?: string; extractMode?: string; maxChars?: number } = {};
       try {
-        args = event.arguments ? JSON.parse(event.arguments) as { url?: string } : {};
+        args = event.arguments ? JSON.parse(event.arguments) as { url?: string; extractMode?: string; maxChars?: number } : {};
       } catch {
         args = {};
       }
@@ -676,10 +720,15 @@ async function processAgentStream(
       if (url) {
         safeSend(win, ipcChannels.agentCommandFlash, `Scraping ${url}...`);
         try {
-          const scrapedText = await scrapeWebsiteContent(url);
-          console.log('[clicky:agent] website scraped successfully', { agentId, url });
+          const result = await scrapeWebsite({
+            url,
+            extractMode: args.extractMode === 'text' ? 'text' : 'markdown',
+            maxChars: args.maxChars,
+          });
+          console.log('[clicky:agent] website scraped successfully', { agentId, url, extractor: result.extractor });
+          const prefix = result.title ? `# ${result.title}\n\n` : '';
           const toolResultRequest: VoiceTurnRequest = {
-            transcript: `Here is the content from ${url}:\n\n${scrapedText}`,
+            transcript: `Here is the content from ${url}:\n\n${prefix}${result.text}`,
             captures: [],
             model: request.model,
             conversationHistory: [
@@ -989,7 +1038,9 @@ ipcMain.handle(ipcChannels.openUrl, async (_event, url: string) => {
 
 ipcMain.handle(ipcChannels.scrapeWebsite, async (_event, url: string): Promise<string> => {
   console.log('[clicky:main] scrapeWebsite invoked', { url });
-  return scrapeWebsiteContent(url);
+  const result = await scrapeWebsite({ url });
+  const prefix = result.title ? `# ${result.title}\n\n` : '';
+  return `${prefix}${result.text}`;
 });
 
 ipcMain.handle(ipcChannels.windowGetContext, (event): WindowContext | undefined => {
