@@ -21,7 +21,7 @@ export async function loadSettings(): Promise<AppSettings> {
     const raw = await readFile(path, 'utf8');
     const parsed = JSON.parse(raw);
     const merged = { ...defaults, ...parsed };
-    console.log('[clicky:settings] loaded from', path, 'email:', JSON.stringify(merged.email));
+    console.log('[clicky:settings] loaded from', path, 'email:', summarizeEmailConfig(merged.email));
     return merged;
   } catch (err) {
     console.error('[clicky:settings] failed to load from', path, 'error:', err);
@@ -45,4 +45,16 @@ export async function saveSettings(settings: AppSettings): Promise<AppSettings> 
 
 function settingsPath(): string {
   return join(app.getPath('userData'), 'settings.json');
+}
+
+function summarizeEmailConfig(email: AppSettings['email']): Record<string, unknown> | undefined {
+  if (!email) return undefined;
+  return {
+    enabled: email.enabled,
+    provider: email.provider,
+    username: email.username,
+    hasPassword: !!email.password,
+    imapHost: email.imapHost,
+    imapPort: email.imapPort
+  };
 }

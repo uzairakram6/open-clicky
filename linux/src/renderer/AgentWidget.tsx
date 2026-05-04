@@ -12,6 +12,12 @@ function inferToolType(command: string, transcript: string): { tone: 'blue' | 'g
   const cmd = command.toLowerCase();
   const t = transcript.toLowerCase();
 
+  if (cmd.includes('writing /tmp/clicky_apps') || cmd.includes('write_file')) {
+    return { tone: 'green', label: 'BUILDING APP' };
+  }
+  if (cmd.includes('/tmp/clicky_apps') && (cmd.includes('xdg-open') || cmd.includes('python'))) {
+    return { tone: 'green', label: 'LAUNCHING APP' };
+  }
   if (cmd.includes('opening') && (cmd.includes('http') || cmd.includes('browser'))) {
     return { tone: 'blue', label: 'OPENING LINK' };
   }

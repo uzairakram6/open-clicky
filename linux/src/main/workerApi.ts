@@ -1,3 +1,4 @@
+import { homedir, tmpdir } from 'node:os';
 import { stripPointTags } from '../shared/pointTags';
 import type { ChatStreamEvent, LlmTool, TranscribeTokenResponse, VoiceTurnRequest } from '../shared/types';
 
@@ -10,7 +11,7 @@ export const executeBashTool: LlmTool = {
   function: {
     name: 'execute_bash_command',
     description:
-      'Execute a bash/shell command on the local Linux machine. Use absolute paths.',
+      'Execute a bash/shell command on the local Linux machine. Use absolute paths. When saving files, use the home directory or /tmp/.',
     parameters: {
       type: 'object',
       properties: {
@@ -20,6 +21,29 @@ export const executeBashTool: LlmTool = {
         }
       },
       required: ['command']
+    }
+  }
+};
+
+export const writeFileTool: LlmTool = {
+  type: 'function',
+  function: {
+    name: 'write_file',
+    description:
+      'Writes code or text to a file under /tmp/clicky_apps on the local Linux file system. Use this to create minimal websites, scripts, and demo apps before launching them.',
+    parameters: {
+      type: 'object',
+      properties: {
+        file_path: {
+          type: 'string',
+          description: 'Absolute file path under /tmp/clicky_apps, such as /tmp/clicky_apps/stopwatch/index.html.'
+        },
+        content: {
+          type: 'string',
+          description: 'The complete UTF-8 text/code content to write.'
+        }
+      },
+      required: ['file_path', 'content']
     }
   }
 };
@@ -98,18 +122,20 @@ function getOpenAIApiKey(): string {
   return key;
 }
 
-function buildOpenAIMessages(request: VoiceTurnRequest): unknown[] {
+export function buildOpenAIMessages(request: VoiceTurnRequest): unknown[] {
   const messages: unknown[] = [];
 
   messages.push({
     role: 'system',
     content:
-      'You are Clicky, a Linux desktop AI assistant with TOOL ACCESS. You have four tools: execute_bash_command, check_email, open_url, and scrape_website.\n\n' +
+      'You are Clicky, a Linux desktop AI assistant with TOOL ACCESS. You have five tools: execute_bash_command, write_file, check_email, open_url, and scrape_website.\n\n' +
       'RULE 1: When the user asks about emails, inbox, messages, or mail — you MUST call the check_email tool. Do not answer from memory. Do not say you cannot access emails. The tool IS available and WILL work.\n\n' +
       'RULE 2: When the user asks about files, directories, system info, or running commands — you MUST call the execute_bash_command tool.\n\n' +
       'RULE 3: When the user asks to open a link, visit a website, or if you see a relevant URL in the screen context the user wants to visit — you MUST call the open_url tool.\n\n' +
       'RULE 4: When the user asks about content on a website, wants to summarize a page, or needs information from a web page — you MUST call the scrape_website tool.\n\n' +
-      'RULE 5: Never claim you cannot do something that a tool can do. Always use the appropriate tool.'
+      'RULE 5: When the user asks you to build an app, website, game, tool, or script, act as a practical software engineer: choose the simplest local technology, prefer one static HTML/CSS/JS file for websites and mini apps, use Python only when it is clearly useful, write files under /tmp/clicky_apps/<short-name>/ with write_file, then launch the result with execute_bash_command using xdg-open for HTML files or python3 for Python scripts. Keep generated apps minimal, functional, and demo-friendly.\n\n' +
+      'RULE 6: Never claim you cannot do something that a tool can do. Always use the appropriate tool.\n\n' +
+      `FILESYSTEM CONTEXT: The user's home directory is ${homedir()}, the temp directory is ${tmpdir()}, and the current working directory is ${process.cwd()}. Generated apps should be saved under /tmp/clicky_apps/. For other user-requested file work, use paths under the home directory or /tmp/. Never assume paths like /home/oai/share exist.`
   });
 
   for (const entry of request.conversationHistory) {
@@ -236,6 +262,14 @@ export class WorkerApi {
           name: executeBashTool.function.name,
           description: executeBashTool.function.description,
           parameters: executeBashTool.function.parameters
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: writeFileTool.function.name,
+          description: writeFileTool.function.description,
+          parameters: writeFileTool.function.parameters
         }
       },
       {

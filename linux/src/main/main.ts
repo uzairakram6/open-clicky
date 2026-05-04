@@ -1,5 +1,5 @@
 import { app, BrowserWindow, desktopCapturer, globalShortcut, ipcMain, Menu, nativeImage, screen, session, shell, Tray } from 'electron';
-import { readFile, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -41,6 +41,8 @@ let tray: Tray | undefined;
 let settings: AppSettings;
 let recorderWindow: BrowserWindow | undefined;
 let recorderWindowReady = false;
+let keepAliveWindow: BrowserWindow | undefined;
+let keepAliveTimer: NodeJS.Timeout | undefined;
 const agents = new Map<string, { window: BrowserWindow; state: AgentState; expanded: boolean }>();
 const windowContexts = new Map<number, WindowContext>();
 const agentWindowMetrics = {
@@ -51,6 +53,7 @@ const agentWindowMetrics = {
   margin: 18,
   stackGap: 10
 };
+const CLICKY_APPS_DIR = resolve(tmpdir(), 'clicky_apps');
 
 function safeSend(win: BrowserWindow | undefined, channel: string, ...args: unknown[]): void {
   if (win && !win.isDestroyed()) {
@@ -58,19 +61,20 @@ function safeSend(win: BrowserWindow | undefined, channel: string, ...args: unkn
   }
 }
 
-const singleInstanceLock = app.requestSingleInstanceLock();
-if (!singleInstanceLock) {
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
+if (!hasSingleInstanceLock) {
+  console.log('[clicky:main] another Clicky instance is already running; exiting this launcher process');
   app.quit();
-}
-app.on('second-instance', (_event, argv) => {
-  if (argv.includes(TOGGLE_RECORDER_ARG)) {
+} else {
+  app.on('second-instance', (_event, argv) => {
+    const source = argv.includes(TOGGLE_RECORDER_ARG) ? 'gnome-custom-shortcut' : 'second-instance';
     if (app.isReady()) {
-      handlePushToTalkTrigger('gnome-custom-shortcut');
+      handlePushToTalkTrigger(source);
     } else {
-      void app.whenReady().then(() => handlePushToTalkTrigger('gnome-custom-shortcut'));
+      void app.whenReady().then(() => handlePushToTalkTrigger(source));
     }
-  }
-});
+  });
+}
 
 async function initApp(): Promise<void> {
   console.log('[clicky:main] app init started');
@@ -80,7 +84,7 @@ async function initApp(): Promise<void> {
     workerBaseUrl: settings.workerBaseUrl,
     model: settings.model,
     selectedCaptureSourceLabel: settings.selectedCaptureSourceLabel,
-    email: settings.email
+    email: summarizeEmailConfig(settings.email)
   });
 
   session.defaultSession.setDisplayMediaRequestHandler((request, callback) => {
@@ -95,9 +99,41 @@ async function initApp(): Promise<void> {
     });
   }, { useSystemPicker: false });
 
+  createKeepAliveWindow();
   createTray();
   registerPushToTalkShortcut();
+
+  if (process.argv.includes(TOGGLE_RECORDER_ARG)) {
+    console.log('[clicky:hotkey] toggle argument detected on startup');
+    openRecorderOrb();
+  }
+  console.log('[clicky:main] app init complete; resident process active');
   void registerGnomeWaylandShortcut();
+}
+
+function createKeepAliveWindow(): void {
+  if (keepAliveWindow && !keepAliveWindow.isDestroyed()) return;
+
+  keepAliveWindow = new BrowserWindow({
+    width: 1,
+    height: 1,
+    show: false,
+    skipTaskbar: true,
+    focusable: false,
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true
+    }
+  });
+
+  keepAliveWindow.on('closed', () => {
+    keepAliveWindow = undefined;
+  });
+  keepAliveTimer ??= setInterval(() => {
+    void 0;
+  }, 60_000);
+  console.log('[clicky:main] keep-alive window created');
 }
 
 function createTray(): void {
@@ -108,7 +144,10 @@ function createTray(): void {
       tray = new Tray(icon);
     if (!tray.isDestroyed()) {
       tray.setToolTip('Clicky');
-      tray.on('click', () => console.log('[clicky:tray] tray clicked; app is push-to-talk triggered'));
+      tray.on('click', () => {
+        console.log('[clicky:tray] tray clicked; opening recorder orb');
+        openRecorderOrb();
+      });
       updateTrayMenu();
       console.log('[clicky:tray] tray created');
     }
@@ -123,7 +162,7 @@ function updateTrayMenu(): void {
   try {
     tray.setContextMenu(Menu.buildFromTemplate([
       { label: 'Settings', click: () => console.log('Settings not yet implemented') },
-      { label: 'Start Recording', click: openRecorderOrb },
+      { label: 'Open Clicky Recorder', click: openRecorderOrb },
       { type: 'separator' },
       { label: 'Quit', click: () => app.quit() }
     ]));
@@ -302,8 +341,12 @@ function setAgentWindowExpanded(agentId: string, expanded: boolean): void {
   entry.window.setBounds({ x, y, width, height }, true);
 }
 
-function buildDefaultActions(transcript: string): AgentAction[] {
+function buildDefaultActions(transcript: string, commands: string[] = []): AgentAction[] {
   const actions: AgentAction[] = [{ id: 'copy', label: 'Copy Response', type: 'copy' }];
+  const generatedAppPath = findGeneratedAppPath(commands);
+  if (generatedAppPath) {
+    actions.push({ id: 'open-generated-app', label: 'Open App', type: 'open_folder', payload: generatedAppPath });
+  }
   if (transcript.toLowerCase().includes('reminder')) {
     actions.push({ id: 'open-reminders', label: 'Open Reminders', type: 'open_app', payload: 'reminders' });
   }
@@ -311,6 +354,18 @@ function buildDefaultActions(transcript: string): AgentAction[] {
     actions.push({ id: 'open-folder', label: 'Open Folder', type: 'open_folder', payload: app.getPath('desktop') });
   }
   return actions;
+}
+
+function findGeneratedAppPath(commands: string[]): string | undefined {
+  for (const command of commands.slice().reverse()) {
+    const htmlMatch = command.match(/\/tmp\/clicky_apps\/[^\s'"`]+\.html\b/);
+    if (htmlMatch) return htmlMatch[0];
+  }
+  for (const command of commands.slice().reverse()) {
+    const pathMatch = command.match(/\/tmp\/clicky_apps\/[^\s'"`]+/);
+    if (pathMatch) return pathMatch[0];
+  }
+  return undefined;
 }
 
 function createErrorAgent(message: string): string {
@@ -466,15 +521,28 @@ function registerPushToTalkShortcut(): void {
   if (registered) {
     console.log('[clicky:hotkey] global shortcut registered', { shortcut });
   } else {
-    console.error('[clicky:hotkey] failed to register global shortcut', { shortcut });
+    const fallback = isWayland() && isGnomeDesktop()
+      ? 'GNOME custom shortcut fallback will be attempted'
+      : 'use the tray menu or set CLICKY_HOTKEY to an unused shortcut';
+    console.warn('[clicky:hotkey] global shortcut unavailable', { shortcut, fallback });
   }
 }
 
 async function registerGnomeWaylandShortcut(): Promise<void> {
-  if (!isWayland() || !isGnomeDesktop()) return;
+  if (!isWayland()) {
+    console.log('[clicky:hotkey] GNOME Wayland shortcut skipped; not a Wayland session');
+    return;
+  }
+  if (!isGnomeDesktop()) {
+    console.log('[clicky:hotkey] GNOME Wayland shortcut skipped; desktop is not GNOME-compatible', {
+      desktop: `${process.env.XDG_CURRENT_DESKTOP ?? ''}:${process.env.DESKTOP_SESSION ?? ''}`
+    });
+    return;
+  }
 
   const binding = process.env.CLICKY_GNOME_HOTKEY ?? '<Control><Alt>space';
   const command = getToggleRecorderCommand();
+  console.log('[clicky:hotkey] attempting GNOME Wayland shortcut registration', { binding, command });
   try {
     const currentRaw = await execFileOutput('gsettings', ['get', 'org.gnome.settings-daemon.plugins.media-keys', 'custom-keybindings']);
     const paths = parseGSettingsStringList(currentRaw);
@@ -496,6 +564,18 @@ async function registerGnomeWaylandShortcut(): Promise<void> {
 function isGnomeDesktop(): boolean {
   const desktop = `${process.env.XDG_CURRENT_DESKTOP ?? ''}:${process.env.DESKTOP_SESSION ?? ''}`.toLowerCase();
   return desktop.includes('gnome') || desktop.includes('ubuntu');
+}
+
+function summarizeEmailConfig(email: AppSettings['email']): Record<string, unknown> | undefined {
+  if (!email) return undefined;
+  return {
+    enabled: email.enabled,
+    provider: email.provider,
+    username: email.username,
+    hasPassword: !!email.password,
+    imapHost: email.imapHost,
+    imapPort: email.imapPort
+  };
 }
 
 function getToggleRecorderCommand(): string {
@@ -540,6 +620,22 @@ async function executeShellCommand(command: string): Promise<ShellResult> {
     const stderr = (err as { stderr?: string }).stderr ?? '';
     return { stdout: stdout.trim(), stderr: stderr.trim(), error: message };
   }
+}
+
+async function writeGeneratedFile(filePath: string, content: string): Promise<string> {
+  if (!isAbsolute(filePath)) {
+    throw new Error('write_file requires an absolute file_path under /tmp/clicky_apps');
+  }
+
+  const resolvedPath = resolve(filePath);
+  const allowedRoot = `${CLICKY_APPS_DIR}/`;
+  if (resolvedPath !== CLICKY_APPS_DIR && !resolvedPath.startsWith(allowedRoot)) {
+    throw new Error(`write_file can only write under ${CLICKY_APPS_DIR}`);
+  }
+
+  await mkdir(dirname(resolvedPath), { recursive: true });
+  await writeFile(resolvedPath, content, 'utf8');
+  return resolvedPath;
 }
 
 async function processAgentStream(
@@ -611,6 +707,48 @@ async function processAgentStream(
         await processAgentStream(api, toolResultRequest, win, state, agentId);
         return;
       }
+    } else if (event.type === 'tool_call' && event.name === 'write_file') {
+      console.log('[clicky:agent] TOOL_CALL write_file RECEIVED', { agentId, argsChars: event.arguments?.length ?? 0 });
+      let args: { file_path?: string; content?: string } = {};
+      try {
+        args = event.arguments ? JSON.parse(event.arguments) as { file_path?: string; content?: string } : {};
+      } catch {
+        args = {};
+      }
+
+      const filePath = args.file_path;
+      const content = args.content;
+      if (filePath && typeof content === 'string') {
+        const feedback = `Writing ${filePath}`;
+        state.commands.push(feedback);
+        safeSend(win, ipcChannels.agentCommandFlash, feedback);
+
+        let transcript: string;
+        try {
+          const writtenPath = await writeGeneratedFile(filePath, content);
+          console.log('[clicky:agent] file written', { agentId, path: writtenPath, chars: content.length });
+          transcript = `File written successfully: ${writtenPath}\nNext, launch it if this is an app, website, game, tool, or script.`;
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          console.error('[clicky:agent] write_file failed', { agentId, filePath, error: message });
+          transcript = `I was unable to write the file. Error: ${message}`;
+        }
+
+        const toolResultRequest: VoiceTurnRequest = {
+          transcript,
+          captures: [],
+          model: request.model,
+          conversationHistory: [
+            ...request.conversationHistory,
+            { role: 'user', content: request.transcript },
+            { role: 'assistant', content: fullResponse }
+          ],
+          agentId
+        };
+
+        await processAgentStream(api, toolResultRequest, win, state, agentId);
+        return;
+      }
     } else if (event.type === 'tool_call' && event.name === 'check_email') {
       console.log('[clicky:agent] TOOL_CALL check_email RECEIVED', { agentId, args: event.arguments });
       let args: { count?: number } = {};
@@ -620,7 +758,7 @@ async function processAgentStream(
         args = {};
       }
       const count = Math.min(Math.max(args.count ?? 5, 1), 10);
-      console.log('[clicky:agent] checking emails', { agentId, count, emailSettings: JSON.stringify(settings.email) });
+      console.log('[clicky:agent] checking emails', { agentId, count, emailSettings: summarizeEmailConfig(settings.email) });
       safeSend(win, ipcChannels.agentCommandFlash, 'Checking emails...');
 
       try {
@@ -763,7 +901,7 @@ async function processAgentStream(
       state.response = fullResponse;
       state.summary = fullResponse.slice(0, 200) + (fullResponse.length > 200 ? '...' : '');
       state.completedAt = Date.now();
-      state.actions = buildDefaultActions(request.transcript);
+      state.actions = buildDefaultActions(request.transcript, state.commands);
       state.conversationHistory = [
         ...request.conversationHistory,
         { role: 'user', content: request.transcript },
@@ -1096,8 +1234,14 @@ ipcMain.handle(ipcChannels.agentFollowUp, async (_event, agentId: string, reques
   }
 });
 
-app.whenReady().then(initApp);
+if (hasSingleInstanceLock) {
+  app.whenReady().then(initApp);
+}
 app.on('will-quit', () => {
+  if (keepAliveTimer) {
+    clearInterval(keepAliveTimer);
+    keepAliveTimer = undefined;
+  }
   globalShortcut.unregisterAll();
   console.log('[clicky:hotkey] global shortcuts unregistered');
 });
