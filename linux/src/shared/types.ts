@@ -90,6 +90,15 @@ export interface AgentAction {
   payload?: string;
 }
 
+export interface EmailSummary {
+  from: string;
+  subject: string;
+  date: string;
+  preview: string;
+  attachments: string[];
+  uid: number;
+}
+
 export interface AgentState {
   id: string;
   status: AgentStatus;
@@ -104,9 +113,12 @@ export interface AgentState {
   model: string;
   conversationHistory: ConversationMessage[];
   captures: ScreenCapturePayload[];
+  color?: string;
+  emails?: EmailSummary[];
 }
 
 export interface WindowContext {
   type: 'recorder' | 'agent';
   agentId?: string;
+  color?: string;
 }

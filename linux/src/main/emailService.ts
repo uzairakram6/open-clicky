@@ -1,13 +1,7 @@
 import Imap from 'imap';
 import { simpleParser } from 'mailparser';
-import type { EmailConfig } from '../shared/types';
-
-export interface EmailSummary {
-  from: string;
-  subject: string;
-  date: string;
-  preview: string;
-}
+import { writeFile } from 'node:fs/promises';
+import type { EmailConfig, EmailSummary } from '../shared/types';
 
 const providerDefaults: Record<string, { host: string; port: number }> = {
   gmail: { host: 'imap.gmail.com', port: 993 },
@@ -67,13 +61,19 @@ export async function fetchRecentEmails(
           const recent = results.slice(-maxEmails);
           const fetch = imap.fetch(recent, { bodies: '' });
 
-          fetch.on('message', (msg) => {
+          fetch.on('message', (msg, seqno) => {
+            let uid: number | undefined;
+            msg.on('attributes', (attrs) => {
+              uid = attrs.uid;
+            });
+
             let buffer = '';
             msg.on('body', (stream) => {
               stream.on('data', (chunk) => {
                 buffer += chunk.toString('utf8');
               });
             });
+
             msg.once('end', async () => {
               try {
                 const parsed = await simpleParser(buffer);
@@ -81,7 +81,9 @@ export async function fetchRecentEmails(
                   from: parsed.from?.text ?? 'Unknown',
                   subject: parsed.subject ?? '(No subject)',
                   date: parsed.date?.toISOString() ?? '',
-                  preview: parsed.text?.slice(0, 300).replace(/\s+/g, ' ').trim() ?? ''
+                  preview: parsed.text?.slice(0, 300).replace(/\s+/g, ' ').trim() ?? '',
+                  attachments: parsed.attachments?.map((a) => a.filename).filter((f): f is string => !!f) ?? [],
+                  uid: uid ?? seqno
                 });
               } catch {
                 void 0;
@@ -107,6 +109,87 @@ export async function fetchRecentEmails(
 
     imap.once('end', () => {
       resolve(emails.reverse());
+    });
+
+    imap.connect();
+  });
+}
+
+export async function downloadAttachment(
+  config: EmailConfig,
+  uid: number,
+  filename: string,
+  destPath: string
+): Promise<void> {
+  if (!config.enabled || !config.username || !config.password) {
+    throw new Error('Email not configured.');
+  }
+
+  const defaults = providerDefaults[config.provider];
+  const host = config.imapHost ?? defaults?.host ?? config.imapHost;
+  const port = config.imapPort ?? defaults?.port ?? 993;
+
+  if (!host) {
+    throw new Error(`Unknown email provider: ${config.provider}.`);
+  }
+
+  const imap = new Imap({
+    user: config.username,
+    password: config.password,
+    host,
+    port,
+    tls: true,
+    tlsOptions: { rejectUnauthorized: false }
+  });
+
+  return new Promise((resolve, reject) => {
+    imap.once('ready', () => {
+      imap.openBox('INBOX', true, (err) => {
+        if (err) {
+          imap.end();
+          reject(new Error(`Failed to open inbox: ${err.message}`));
+          return;
+        }
+
+        const fetch = imap.fetch([uid], { bodies: '' });
+        let buffer = '';
+
+        fetch.on('message', (msg: any) => {
+          msg.on('body', (stream: any) => {
+            stream.on('data', (chunk: any) => {
+              buffer += chunk.toString('utf8');
+            });
+          });
+
+          msg.once('end', async () => {
+            try {
+              const parsed = await simpleParser(buffer);
+              const attachment = parsed.attachments?.find((a) => a.filename === filename);
+              if (!attachment) {
+                reject(new Error(`Attachment "${filename}" not found in email ${uid}.`));
+                return;
+              }
+              await writeFile(destPath, attachment.content);
+              resolve();
+            } catch (err) {
+              reject(err instanceof Error ? err : new Error(String(err)));
+            }
+          });
+        });
+
+        fetch.once('error', (err: any) => {
+          imap.end();
+          reject(new Error(`Fetch failed: ${err.message}`));
+        });
+
+        fetch.once('end', () => {
+          imap.end();
+        });
+      });
+    });
+
+    imap.once('error', (err) => {
+      reject(new Error(`IMAP connection failed: ${err.message}`));
     });
 
     imap.connect();

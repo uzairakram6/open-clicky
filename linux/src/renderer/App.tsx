@@ -21,7 +21,7 @@ function App() {
   }
 
   if (context.type === 'agent' && context.agentId) {
-    return <AgentWidget agentId={context.agentId} />;
+    return <AgentWidget agentId={context.agentId} color={context.color} />;
   }
 
   return null;

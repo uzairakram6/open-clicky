@@ -1,7 +1,7 @@
 import { app, BrowserWindow, desktopCapturer, globalShortcut, ipcMain, Menu, nativeImage, screen, session, shell, Tray } from 'electron';
-import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, stat, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { basename, dirname, extname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { exec, execFile } from 'node:child_process';
@@ -10,7 +10,7 @@ import { loadSettings, saveSettings } from './settings';
 import { WorkerApi } from './workerApi';
 import { scrapeWebsite } from './scraper';
 import { ipcChannels } from '../shared/ipcChannels';
-import type { AppSettings, CaptureSource, VoiceTurnRequest, AgentState, WindowContext, AgentAction, ScreenCapturePayload, ShellResult, RecordedAudioPayload } from '../shared/types';
+import type { AppSettings, CaptureSource, VoiceTurnRequest, AgentState, WindowContext, AgentAction, ScreenCapturePayload, ShellResult, RecordedAudioPayload, EmailSummary } from '../shared/types';
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
@@ -54,11 +54,22 @@ const agentWindowMetrics = {
   stackGap: 10
 };
 const CLICKY_APPS_DIR = resolve(tmpdir(), 'clicky_apps');
+const AGENT_COLORS = ['#FFD60A', '#FF453A', '#0A84FF', '#BF5AF2'];
+const assignedAgentColors = new Map<string, string>();
 
 function safeSend(win: BrowserWindow | undefined, channel: string, ...args: unknown[]): void {
   if (win && !win.isDestroyed()) {
     win.webContents.send(channel, ...args);
   }
+}
+
+function pickAgentColor(): string {
+  const used = new Set(assignedAgentColors.values());
+  const available = AGENT_COLORS.filter((c) => !used.has(c));
+  if (available.length > 0) {
+    return available[Math.floor(Math.random() * available.length)];
+  }
+  return AGENT_COLORS[Math.floor(Math.random() * AGENT_COLORS.length)];
 }
 
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
@@ -273,11 +284,14 @@ function createOrbWindow(): void {
 }
 
 function createAgentWindow(agentId: string): BrowserWindow {
+  const color = pickAgentColor();
+  assignedAgentColors.set(agentId, color);
+
   const primary = screen.getPrimaryDisplay();
   const { miniWidth: width, miniHeight: height, margin, stackGap } = agentWindowMetrics;
   const x = primary.workArea.x + primary.workArea.width - width - margin;
   const y = primary.workArea.y + margin + (agents.size * (height + stackGap));
-  console.log('[clicky:agent] creating agent window', { agentId, x, y, width, height });
+  console.log('[clicky:agent] creating agent window', { agentId, x, y, width, height, color });
 
   const win = new BrowserWindow({
     width,
@@ -302,8 +316,8 @@ function createAgentWindow(agentId: string): BrowserWindow {
   });
 
   const winId = win.webContents.id;
-  windowContexts.set(winId, { type: 'agent', agentId });
-  console.log('[clicky:agent] window context registered', { agentId, winId });
+  windowContexts.set(winId, { type: 'agent', agentId, color });
+  console.log('[clicky:agent] window context registered', { agentId, winId, color });
 
   if (process.env.VITE_DEV_SERVER_URL) {
     void win.loadURL(process.env.VITE_DEV_SERVER_URL);
@@ -318,6 +332,7 @@ function createAgentWindow(agentId: string): BrowserWindow {
 
   win.on('closed', () => {
     agents.delete(agentId);
+    assignedAgentColors.delete(agentId);
     windowContexts.delete(winId);
     console.log('[clicky:agent] window closed and state removed', { agentId, winId });
   });
@@ -341,7 +356,7 @@ function setAgentWindowExpanded(agentId: string, expanded: boolean): void {
   entry.window.setBounds({ x, y, width, height }, true);
 }
 
-function buildDefaultActions(transcript: string, commands: string[] = []): AgentAction[] {
+function buildDefaultActions(transcript: string, commands: string[] = [], emails?: EmailSummary[]): AgentAction[] {
   const actions: AgentAction[] = [{ id: 'copy', label: 'Copy Response', type: 'copy' }];
   const generatedAppPath = findGeneratedAppPath(commands);
   if (generatedAppPath) {
@@ -352,6 +367,18 @@ function buildDefaultActions(transcript: string, commands: string[] = []): Agent
   }
   if (transcript.toLowerCase().includes('desktop') || transcript.toLowerCase().includes('file') || transcript.toLowerCase().includes('folder')) {
     actions.push({ id: 'open-folder', label: 'Open Folder', type: 'open_folder', payload: app.getPath('desktop') });
+  }
+  if (emails) {
+    for (const email of emails) {
+      for (const filename of email.attachments) {
+        actions.push({
+          id: `download-attachment-${email.uid}-${filename}`,
+          label: `Download ${filename}`,
+          type: 'custom',
+          payload: JSON.stringify({ type: 'download_email_attachment', uid: email.uid, filename })
+        });
+      }
+    }
   }
   return actions;
 }
@@ -372,6 +399,7 @@ function createErrorAgent(message: string): string {
   const agentId = randomUUID();
   console.log('[clicky:agent] creating error agent', { agentId, message });
   const win = createAgentWindow(agentId);
+  const color = assignedAgentColors.get(agentId);
   const state: AgentState = {
     id: agentId,
     status: 'error',
@@ -385,7 +413,8 @@ function createErrorAgent(message: string): string {
     conversationHistory: [],
     captures: [],
     createdAt: Date.now(),
-    completedAt: Date.now()
+    completedAt: Date.now(),
+    color
   };
 
   agents.set(agentId, { window: win, state, expanded: false });
@@ -512,6 +541,23 @@ function splitEnvList(value: string | undefined): string[] {
   return value?.split(',')
     .map((item) => item.trim())
     .filter(Boolean) ?? [];
+}
+
+async function ensureUniquePath(dir: string, filename: string): Promise<string> {
+  let destPath = join(dir, filename);
+  let counter = 1;
+  const ext = extname(filename);
+  const base = basename(filename, ext);
+  while (true) {
+    try {
+      await stat(destPath);
+      destPath = join(dir, `${base} (${counter})${ext}`);
+      counter++;
+    } catch {
+      break;
+    }
+  }
+  return destPath;
 }
 
 function registerPushToTalkShortcut(): void {
@@ -766,9 +812,16 @@ async function processAgentStream(
         const emailConfig = settings.email ?? { enabled: false, provider: 'gmail', username: '', password: '' };
         console.log('[clicky:agent] email config resolved', { enabled: emailConfig.enabled, username: emailConfig.username, hasPassword: !!emailConfig.password });
         const emails = await fetchRecentEmails(emailConfig, count);
+        state.emails = emails;
         const emailSummary = emails.length === 0
           ? 'No emails found in your inbox.'
-          : emails.map((e, i) => `${i + 1}. From: ${e.from}\nSubject: ${e.subject}\nDate: ${e.date}\nPreview: ${e.preview}`).join('\n\n');
+          : emails.map((e, i) => {
+              let text = `Email #${i + 1}\nFrom: ${e.from}\nSubject: ${e.subject}\nDate: ${e.date}\nPreview: ${e.preview}`;
+              if (e.attachments.length > 0) {
+                text += `\nAttachments: ${e.attachments.join(', ')}`;
+              }
+              return text;
+            }).join('\n\n');
 
         const toolResultRequest: VoiceTurnRequest = {
           transcript: `Here are the recent emails:\n${emailSummary}`,
@@ -896,12 +949,78 @@ async function processAgentStream(
           return;
         }
       }
+    } else if (event.type === 'tool_call' && event.name === 'download_email_attachment') {
+      console.log('[clicky:agent] TOOL_CALL download_email_attachment RECEIVED', { agentId, args: event.arguments });
+      let args: { email_number?: number; filename?: string } = {};
+      try {
+        args = event.arguments ? JSON.parse(event.arguments) as { email_number?: number; filename?: string } : {};
+      } catch {
+        args = {};
+      }
+      const emailNumber = args.email_number;
+      const filename = args.filename;
+      const emails = state.emails ?? [];
+      const email = emailNumber && emailNumber > 0 && emailNumber <= emails.length ? emails[emailNumber - 1] : undefined;
+
+      if (!email || !filename) {
+        const toolResultRequest: VoiceTurnRequest = {
+          transcript: 'I could not find the email or attachment you asked for. Please specify the email number and filename clearly.',
+          captures: [],
+          model: request.model,
+          conversationHistory: [
+            ...request.conversationHistory,
+            { role: 'user', content: request.transcript },
+            { role: 'assistant', content: fullResponse }
+          ],
+          agentId
+        };
+        await processAgentStream(api, toolResultRequest, win, state, agentId);
+        return;
+      }
+
+      safeSend(win, ipcChannels.agentCommandFlash, `Downloading ${filename}...`);
+      try {
+        const emailConfig = settings.email ?? { enabled: false, provider: 'gmail', username: '', password: '' };
+        const { downloadAttachment } = await import('./emailService');
+        const destPath = await ensureUniquePath(app.getPath('downloads'), filename);
+        await downloadAttachment(emailConfig, email.uid, filename, destPath);
+        console.log('[clicky:agent] attachment downloaded', { agentId, uid: email.uid, filename, destPath });
+        const toolResultRequest: VoiceTurnRequest = {
+          transcript: `The attachment "${filename}" has been downloaded to ${destPath}.`,
+          captures: [],
+          model: request.model,
+          conversationHistory: [
+            ...request.conversationHistory,
+            { role: 'user', content: request.transcript },
+            { role: 'assistant', content: fullResponse }
+          ],
+          agentId
+        };
+        await processAgentStream(api, toolResultRequest, win, state, agentId);
+        return;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.error('[clicky:agent] download_email_attachment failed', { agentId, uid: email.uid, filename, error: message });
+        const toolResultRequest: VoiceTurnRequest = {
+          transcript: `I was unable to download the attachment "${filename}". Error: ${message}`,
+          captures: [],
+          model: request.model,
+          conversationHistory: [
+            ...request.conversationHistory,
+            { role: 'user', content: request.transcript },
+            { role: 'assistant', content: fullResponse }
+          ],
+          agentId
+        };
+        await processAgentStream(api, toolResultRequest, win, state, agentId);
+        return;
+      }
     } else if (event.type === 'done') {
       state.status = 'done';
       state.response = fullResponse;
       state.summary = fullResponse.slice(0, 200) + (fullResponse.length > 200 ? '...' : '');
       state.completedAt = Date.now();
-      state.actions = buildDefaultActions(request.transcript, state.commands);
+      state.actions = buildDefaultActions(request.transcript, state.commands, state.emails);
       state.conversationHistory = [
         ...request.conversationHistory,
         { role: 'user', content: request.transcript },
@@ -1100,6 +1219,7 @@ ipcMain.handle(ipcChannels.agentSpawn, async (_event, request: VoiceTurnRequest)
     model: request.model
   });
   const win = createAgentWindow(agentId);
+  const color = assignedAgentColors.get(agentId);
 
   const state: AgentState = {
     id: agentId,
@@ -1112,7 +1232,8 @@ ipcMain.handle(ipcChannels.agentSpawn, async (_event, request: VoiceTurnRequest)
     model: request.model,
     conversationHistory: request.conversationHistory,
     captures: request.captures,
-    createdAt: Date.now()
+    createdAt: Date.now(),
+    color
   };
 
   agents.set(agentId, { window: win, state, expanded: false });
@@ -1162,6 +1283,18 @@ ipcMain.handle(ipcChannels.agentRunAction, async (_event, action: AgentAction) =
     });
   } else if (action.type === 'open_url' && action.payload) {
     await shell.openExternal(action.payload);
+  } else if (action.type === 'custom' && action.payload) {
+    const payload = JSON.parse(action.payload) as { type: string; uid: number; filename: string };
+    if (payload.type === 'download_email_attachment') {
+      const emailConfig = settings.email ?? { enabled: false, provider: 'gmail', username: '', password: '' };
+      if (!emailConfig.enabled) {
+        throw new Error('Email not configured.');
+      }
+      const { downloadAttachment } = await import('./emailService');
+      const destPath = await ensureUniquePath(app.getPath('downloads'), payload.filename);
+      await downloadAttachment(emailConfig, payload.uid, payload.filename, destPath);
+      await shell.openPath(dirname(destPath));
+    }
   }
 });
 

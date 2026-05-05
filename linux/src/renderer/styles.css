@@ -14,6 +14,7 @@ button, input, select, textarea {
 }
 
 .agent-widget {
+  --agent-color: #34C759;
   width: 52px;
   height: 52px;
   background: rgba(30, 30, 30, 0.7);
@@ -78,7 +79,7 @@ button, input, select, textarea {
   display: grid;
   place-items: center;
   background:
-    radial-gradient(circle at 50% 58%, rgba(52, 199, 89, 0.22), transparent 42%),
+    radial-gradient(circle at 50% 58%, color-mix(in srgb, var(--agent-color) 22%, transparent), transparent 42%),
     rgba(16, 16, 18, 0.94);
   border: 0;
   border-radius: inherit;
@@ -132,8 +133,8 @@ button, input, select, textarea {
   height: 0;
   border-left: 8px solid transparent;
   border-right: 8px solid transparent;
-  border-bottom: 14px solid #34C759;
-  filter: drop-shadow(0 0 8px rgba(52, 199, 89, 0.55));
+  border-bottom: 14px solid var(--agent-color);
+  filter: drop-shadow(0 0 8px color-mix(in srgb, var(--agent-color) 55%, transparent));
   transform: translateY(-1px);
 }
 
@@ -242,13 +243,13 @@ button, input, select, textarea {
 
 @keyframes pulse-dot {
   0% {
-    box-shadow: 0 0 0 0 rgba(52, 199, 89, 0.7);
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--agent-color) 70%, transparent);
   }
   70% {
-    box-shadow: 0 0 0 6px rgba(52, 199, 89, 0);
+    box-shadow: 0 0 0 6px color-mix(in srgb, var(--agent-color) 0%, transparent);
   }
   100% {
-    box-shadow: 0 0 0 0 rgba(52, 199, 89, 0);
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--agent-color) 0%, transparent);
   }
 }
 
@@ -409,7 +410,7 @@ button, input, select, textarea {
 
 @keyframes terminalFlash {
   from {
-    background: rgba(52, 199, 89, 0.15);
+    background: color-mix(in srgb, var(--agent-color) 15%, transparent);
   }
   to {
     background: rgba(0, 0, 0, 0.3);
@@ -426,15 +427,15 @@ button, input, select, textarea {
 .done-badge {
   display: inline-flex;
   align-self: flex-start;
-  background: rgba(52, 199, 89, 0.15);
-  color: #34C759;
+  background: color-mix(in srgb, var(--agent-color) 15%, transparent);
+  color: var(--agent-color);
   font-size: 10px;
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.08em;
   padding: 4px 10px;
   border-radius: 999px;
-  border: 1px solid rgba(52, 199, 89, 0.25);
+  border: 1px solid color-mix(in srgb, var(--agent-color) 25%, transparent);
 }
 
 .agent-summary {
@@ -568,7 +569,7 @@ button, input, select, textarea {
 }
 
 .voice-btn:hover {
-  border-color: rgba(48, 209, 88, 0.5);
+  border-color: color-mix(in srgb, var(--agent-color) 50%, transparent);
 }
 
 .follow-up-recording,
@@ -637,7 +638,7 @@ button, input, select, textarea {
 .meter span {
   display: block;
   height: 100%;
-  background: #34C759;
+  background: var(--agent-color);
   border-radius: 999px;
   transition: width 0.05s linear;
 }

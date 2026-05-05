@@ -6,6 +6,7 @@ import { useVoiceRecorder } from './useVoiceRecorder';
 
 export interface AgentWidgetProps {
   agentId: string;
+  color?: string;
 }
 
 function inferToolType(command: string, transcript: string): { tone: 'blue' | 'green' | 'red'; label: string } {
@@ -59,7 +60,7 @@ function inferToolType(command: string, transcript: string): { tone: 'blue' | 'g
   return { tone: 'green', label: 'WORKING' };
 }
 
-export function AgentWidget({ agentId }: AgentWidgetProps) {
+export function AgentWidget({ agentId, color }: AgentWidgetProps) {
   const [agent, setAgent] = useState<AgentState | undefined>();
   const [response, setResponse] = useState('');
   const [error, setError] = useState('');
@@ -226,6 +227,7 @@ export function AgentWidget({ agentId }: AgentWidgetProps) {
   return (
     <div
       className={`agent-widget ${isExpanded ? 'expanded' : 'minimized'} ${isError ? 'status-error' : ''}`}
+      style={{ '--agent-color': color ?? '#34C759' } as React.CSSProperties}
     >
       <button type="button" className="agent-mini" onClick={expandWidget} aria-label="Open agent details">
         <span className={`mini-status ${status}`} />

@@ -114,6 +114,29 @@ export const scrapeWebsiteTool: LlmTool = {
   }
 };
 
+export const downloadEmailAttachmentTool: LlmTool = {
+  type: 'function',
+  function: {
+    name: 'download_email_attachment',
+    description:
+      'Download a specific attachment from a previously fetched email. Use this when the user asks to download an attachment from an email you have already listed. You must know the email number (1-indexed from the most recent check_email result) and the exact filename of the attachment.',
+    parameters: {
+      type: 'object',
+      properties: {
+        email_number: {
+          type: 'number',
+          description: 'The email number as shown in the previous check_email result (1 for the first email, 2 for the second, etc.)'
+        },
+        filename: {
+          type: 'string',
+          description: 'The exact filename of the attachment to download, including the extension.'
+        }
+      },
+      required: ['email_number', 'filename']
+    }
+  }
+};
+
 function getOpenAIApiKey(): string {
   const key = process.env.OPENAI_API_KEY;
   if (!key) {
@@ -128,13 +151,20 @@ export function buildOpenAIMessages(request: VoiceTurnRequest): unknown[] {
   messages.push({
     role: 'system',
     content:
-      'You are Clicky, a Linux desktop AI assistant with TOOL ACCESS. You have five tools: execute_bash_command, write_file, check_email, open_url, and scrape_website.\n\n' +
+      'You are Clicky, a friendly and focused Linux desktop AI assistant with TOOL ACCESS. You have six tools: execute_bash_command, write_file, check_email, open_url, scrape_website, and download_email_attachment.\n\n' +
+      'PERSONALITY:\n' +
+      '- You are helpful, warm, and approachable — like a knowledgeable coworker who genuinely wants to make the user\'s day easier.\n' +
+      '- Keep responses concise and actionable. Avoid unnecessary fluff, but a little warmth goes a long way.\n' +
+      '- Celebrate small wins. When something works, a quick "Done!" or "There you go" is great.\n' +
+      '- If something fails, be honest and constructive: explain what happened and suggest a fix. No robotic apologies.\n' +
+      '- Match the user\'s energy. If they\'re casual, be casual. If they\'re direct, be direct.\n\n' +
       'RULE 1: When the user asks about emails, inbox, messages, or mail — you MUST call the check_email tool. Do not answer from memory. Do not say you cannot access emails. The tool IS available and WILL work.\n\n' +
       'RULE 2: When the user asks about files, directories, system info, or running commands — you MUST call the execute_bash_command tool.\n\n' +
       'RULE 3: When the user asks to open a link, visit a website, or if you see a relevant URL in the screen context the user wants to visit — you MUST call the open_url tool.\n\n' +
       'RULE 4: When the user asks about content on a website, wants to summarize a page, or needs information from a web page — you MUST call the scrape_website tool.\n\n' +
       'RULE 5: When the user asks you to build an app, website, game, tool, or script, act as a practical software engineer: choose the simplest local technology, prefer one static HTML/CSS/JS file for websites and mini apps, use Python only when it is clearly useful, write files under /tmp/clicky_apps/<short-name>/ with write_file, then launch the result with execute_bash_command using xdg-open for HTML files or python3 for Python scripts. Keep generated apps minimal, functional, and demo-friendly.\n\n' +
-      'RULE 6: Never claim you cannot do something that a tool can do. Always use the appropriate tool.\n\n' +
+      'RULE 6: When the user asks to download an attachment from an email you have already listed, you MUST call the download_email_attachment tool with the correct email_number and filename.\n\n' +
+      'RULE 7: Never claim you cannot do something that a tool can do. Always use the appropriate tool.\n\n' +
       `FILESYSTEM CONTEXT: The user's home directory is ${homedir()}, the temp directory is ${tmpdir()}, and the current working directory is ${process.cwd()}. Generated apps should be saved under /tmp/clicky_apps/. For other user-requested file work, use paths under the home directory or /tmp/. Never assume paths like /home/oai/share exist.`
   });
 
@@ -294,6 +324,14 @@ export class WorkerApi {
           name: scrapeWebsiteTool.function.name,
           description: scrapeWebsiteTool.function.description,
           parameters: scrapeWebsiteTool.function.parameters
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: downloadEmailAttachmentTool.function.name,
+          description: downloadEmailAttachmentTool.function.description,
+          parameters: downloadEmailAttachmentTool.function.parameters
         }
       }
     ];
