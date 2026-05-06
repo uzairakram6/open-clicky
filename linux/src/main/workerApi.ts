@@ -1,6 +1,6 @@
 import { homedir, tmpdir } from 'node:os';
 import { stripPointTags } from '../shared/pointTags';
-import type { ChatStreamEvent, LlmTool, TranscribeTokenResponse, VoiceTurnRequest } from '../shared/types';
+import type { ChatStreamEvent, LlmTool, RealtimeCallResponse, TranscribeTokenResponse, VoiceTurnRequest } from '../shared/types';
 
 export interface WorkerApiConfig {
   workerBaseUrl: string;
@@ -184,6 +184,14 @@ export function buildOpenAIMessages(request: VoiceTurnRequest): unknown[] {
   return messages;
 }
 
+const DEBUG_OPENAI_STREAM = process.env.CLICKY_DEBUG_OPENAI_STREAM === '1';
+
+function debugOpenAI(...args: unknown[]): void {
+  if (DEBUG_OPENAI_STREAM) {
+    console.log(...args);
+  }
+}
+
 async function* parseOpenAISse(response: Response): AsyncGenerator<ChatStreamEvent> {
   console.log('[clicky:openai] SSE parser started');
   if (!response.ok) {
@@ -241,7 +249,7 @@ async function* parseOpenAISse(response: Response): AsyncGenerator<ChatStreamEve
         if (delta?.tool_calls && delta.tool_calls.length > 0) {
           toolCallDeltaCount++;
           const tc = delta.tool_calls[0];
-          console.log('[clicky:openai] Tool call delta:', JSON.stringify(tc));
+          debugOpenAI('[clicky:openai] Tool call delta:', JSON.stringify(tc));
           if (tc.id && tc.function?.name) {
             toolCallBuffer = { id: tc.id, name: tc.function.name, arguments: tc.function.arguments ?? '' };
             console.log('[clicky:openai] Tool call started:', toolCallBuffer.name);
@@ -251,9 +259,7 @@ async function* parseOpenAISse(response: Response): AsyncGenerator<ChatStreamEve
         }
         if (delta?.content) {
           chunkCount++;
-          if (chunkCount <= 3) {
-            console.log('[clicky:openai] Text chunk:', delta.content.slice(0, 100));
-          }
+          debugOpenAI('[clicky:openai] Text chunk:', delta.content.slice(0, 100));
           yield { type: 'chunk', text: delta.content };
         }
       } catch {
@@ -346,7 +352,7 @@ export class WorkerApi {
 
     console.log('[clicky:openai] Sending request. Model:', request.model);
     console.log('[clicky:openai] Tools registered:', tools.map(t => t.function.name).join(', '));
-    console.log('[clicky:openai] Messages:', JSON.stringify(messages, null, 2));
+    debugOpenAI('[clicky:openai] Messages:', JSON.stringify(messages, null, 2));
 
     const response = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
@@ -360,7 +366,7 @@ export class WorkerApi {
     console.log('[clicky:openai] Response status:', response.status);
 
     for await (const event of parseOpenAISse(response)) {
-      console.log('[clicky:openai] Yielding event:', event.type, event.type === 'chunk' ? event.text?.slice(0, 50) : '', event.type === 'tool_call' ? event.name : '');
+      debugOpenAI('[clicky:openai] Yielding event:', event.type, event.type === 'chunk' ? event.text?.slice(0, 50) : '', event.type === 'tool_call' ? event.name : '');
       if (event.type === 'chunk' && event.text) {
         yield { ...event, text: stripPointTags(event.text) };
       } else {
@@ -370,7 +376,109 @@ export class WorkerApi {
   }
 
   async getTranscribeToken(): Promise<TranscribeTokenResponse> {
-    return { token: '' };
+    const apiKey = getOpenAIApiKey();
+    const response = await fetch('https://api.openai.com/v1/realtime/client_secrets', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        expires_after: {
+          anchor: 'created_at',
+          seconds: 600
+        },
+        session: {
+          type: 'transcription',
+          audio: {
+            input: {
+              format: { type: 'audio/pcm', rate: 24000 },
+              transcription: { model: 'gpt-4o-mini-transcribe' },
+              noise_reduction: { type: 'near_field' },
+              turn_detection: {
+                type: 'server_vad',
+                threshold: 0.5,
+                prefix_padding_ms: 300,
+                silence_duration_ms: 500
+              }
+            }
+          }
+        }
+      })
+    });
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => '');
+      throw new Error(`OpenAI realtime client_secrets failed: HTTP ${response.status} ${body}`);
+    }
+
+    const data = (await response.json()) as {
+      value?: string;
+      expires_at?: number | string;
+    };
+
+    if (typeof data.value !== 'string') {
+      throw new Error('OpenAI realtime client_secrets response missing value');
+    }
+
+    let expiresAt: number;
+    if (typeof data.expires_at === 'number') {
+      expiresAt = data.expires_at;
+    } else if (typeof data.expires_at === 'string') {
+      expiresAt = Math.floor(new Date(data.expires_at).getTime() / 1000);
+    } else {
+      throw new Error('OpenAI realtime client_secrets response missing expires_at');
+    }
+
+    return {
+      token: data.value,
+      expiresAt,
+      websocketUrl: 'wss://api.openai.com/v1/realtime',
+      model: 'gpt-4o-mini-transcribe',
+      sampleRate: 24000
+    };
+  }
+
+  async createRealtimeTranscriptionCall(offerSdp: string): Promise<RealtimeCallResponse> {
+    const apiKey = getOpenAIApiKey();
+    const form = new FormData();
+    form.set('sdp', new Blob([offerSdp], { type: 'application/sdp' }), 'offer.sdp');
+    form.set('session', new Blob([JSON.stringify({
+      type: 'realtime',
+      model: 'gpt-realtime',
+      instructions: 'Transcribe the user audio accurately. Do not proactively answer unless a client event asks for a response.',
+      audio: {
+        input: {
+          transcription: { model: 'gpt-4o-mini-transcribe' },
+          noise_reduction: { type: 'near_field' },
+          turn_detection: {
+            type: 'server_vad',
+            threshold: 0.5,
+            prefix_padding_ms: 300,
+            silence_duration_ms: 500
+          }
+        }
+      }
+    })], { type: 'application/json' }));
+
+    const response = await fetch('https://api.openai.com/v1/realtime/calls', {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${apiKey}`,
+        'OpenAI-Beta': 'realtime=v1'
+      },
+      body: form
+    });
+
+    const answerSdp = await response.text();
+    if (!response.ok) {
+      throw new Error(`OpenAI realtime call failed: HTTP ${response.status} ${answerSdp}`);
+    }
+
+    return {
+      answerSdp,
+      callId: response.headers.get('location')?.split('/').filter(Boolean).pop() ?? undefined
+    };
   }
 
   async synthesizeSpeech(text: string): Promise<ArrayBuffer> {

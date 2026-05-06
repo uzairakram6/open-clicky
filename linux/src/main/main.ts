@@ -10,7 +10,8 @@ import { loadSettings, saveSettings } from './settings';
 import { WorkerApi } from './workerApi';
 import { scrapeWebsite } from './scraper';
 import { ipcChannels } from '../shared/ipcChannels';
-import type { AppSettings, CaptureSource, VoiceTurnRequest, AgentState, WindowContext, AgentAction, ScreenCapturePayload, ShellResult, RecordedAudioPayload, EmailSummary } from '../shared/types';
+import { buildTaskAcknowledgement, cleanAcknowledgementSpeech } from '../shared/acknowledgement';
+import type { AppSettings, CaptureSource, VoiceTurnRequest, AgentState, WindowContext, AgentAction, ScreenCapturePayload, ShellResult, RecordedAudioPayload, EmailSummary, TranscribeTokenResponse } from '../shared/types';
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
@@ -41,8 +42,11 @@ let tray: Tray | undefined;
 let settings: AppSettings;
 let recorderWindow: BrowserWindow | undefined;
 let recorderWindowReady = false;
+let cursorTrackingInterval: NodeJS.Timeout | undefined;
 let keepAliveWindow: BrowserWindow | undefined;
 let keepAliveTimer: NodeJS.Timeout | undefined;
+let cachedTranscribeToken: { value: Awaited<ReturnType<WorkerApi['getTranscribeToken']>>; fetchedAt: number } | undefined;
+let pendingTranscribeToken: Promise<TranscribeTokenResponse> | undefined;
 const agents = new Map<string, { window: BrowserWindow; state: AgentState; expanded: boolean }>();
 const windowContexts = new Map<number, WindowContext>();
 const agentWindowMetrics = {
@@ -56,11 +60,194 @@ const agentWindowMetrics = {
 const CLICKY_APPS_DIR = resolve(tmpdir(), 'clicky_apps');
 const AGENT_COLORS = ['#FFD60A', '#FF453A', '#0A84FF', '#BF5AF2'];
 const assignedAgentColors = new Map<string, string>();
+const CHAT_CHUNK_FLUSH_MS = 50;
+const CHAT_CHUNK_MAX_CHARS = 160;
+const LOCAL_SPEECH_MAX_CHARS = 1200;
 
 function safeSend(win: BrowserWindow | undefined, channel: string, ...args: unknown[]): void {
   if (win && !win.isDestroyed()) {
     win.webContents.send(channel, ...args);
   }
+}
+
+function createChatChunkFlusher(win: BrowserWindow): { append: (text: string) => void; flush: () => void; dispose: () => void } {
+  let pending = '';
+  let timer: NodeJS.Timeout | undefined;
+
+  const flush = () => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = undefined;
+    }
+    if (!pending) return;
+    const text = pending;
+    pending = '';
+    safeSend(win, ipcChannels.chatChunk, text);
+  };
+
+  const scheduleFlush = () => {
+    if (timer) return;
+    timer = setTimeout(flush, CHAT_CHUNK_FLUSH_MS);
+    timer.unref();
+  };
+
+  return {
+    append: (text: string) => {
+      pending += text;
+      if (pending.length >= CHAT_CHUNK_MAX_CHARS) {
+        flush();
+      } else {
+        scheduleFlush();
+      }
+    },
+    flush,
+    dispose: flush
+  };
+}
+
+function normalizeSpeechText(text: string): string {
+  return cleanAcknowledgementSpeech(text, LOCAL_SPEECH_MAX_CHARS).replace(/\s+/g, ' ').trim();
+}
+
+async function speakWithSystemTts(text: string): Promise<boolean> {
+  const engines = [
+    { command: 'spd-say', args: (value: string) => [value] },
+    { command: 'espeak-ng', args: (value: string) => [value] },
+    { command: 'espeak', args: (value: string) => [value] }
+  ];
+
+  for (const engine of engines) {
+    try {
+      await execFileAsync(engine.command, engine.args(text), { timeout: 3000 });
+      console.log('[clicky:tts] system speech requested', { engine: engine.command, chars: text.length });
+      return true;
+    } catch (error) {
+      const code = typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : undefined;
+      if (code !== 'ENOENT') {
+        console.warn('[clicky:tts] system speech failed', {
+          engine: engine.command,
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+    }
+  }
+
+  return false;
+}
+
+function speakWithBrowserSpeech(win: BrowserWindow, text: string): Promise<boolean> {
+  return win.webContents.executeJavaScript(`
+    (() => {
+      if (!('speechSynthesis' in window) || !('SpeechSynthesisUtterance' in window)) {
+        return false;
+      }
+      const utterance = new SpeechSynthesisUtterance(${JSON.stringify(text)});
+      utterance.rate = 1.08;
+      utterance.pitch = 1;
+      utterance.volume = 1;
+      window.speechSynthesis.speak(utterance);
+      return true;
+    })();
+  `, true) as Promise<boolean>;
+}
+
+async function speakTextLocally(win: BrowserWindow, text: string): Promise<boolean> {
+  const speechText = normalizeSpeechText(text);
+  if (!speechText) {
+    return false;
+  }
+
+  if (await speakWithSystemTts(speechText)) {
+    return true;
+  }
+
+  return speakWithBrowserSpeech(win, speechText);
+}
+
+function speakWithOpenAiInBackground(api: WorkerApi, win: BrowserWindow, agentId: string, text: string, reason: 'acknowledgement' | 'response'): void {
+  void (async () => {
+    const speechText = normalizeSpeechText(stripPointTagsForSpeech(text));
+    if (!speechText) return;
+
+    try {
+      console.log('[clicky:agent] requesting OpenAI speech', { agentId, reason, chars: speechText.length });
+      const audio = await api.synthesizeSpeech(speechText);
+      if (reason === 'acknowledgement' && agents.get(agentId)?.state.status !== 'running') {
+        console.log('[clicky:agent] skipped stale acknowledgement speech', { agentId });
+        return;
+      }
+      safeSend(win, ipcChannels.ttsAudio, audio);
+      console.log('[clicky:agent] OpenAI speech audio sent', { agentId, reason, bytes: audio.byteLength });
+    } catch (error) {
+      console.warn('[clicky:agent] OpenAI speech failed; falling back to local speech', {
+        agentId,
+        reason,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      try {
+        await speakTextLocally(win, speechText);
+      } catch {
+        void 0;
+      }
+    }
+  })();
+}
+
+function waitForWindowLoad(win: BrowserWindow): Promise<void> {
+  if (win.isDestroyed() || !win.webContents.isLoading()) {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+    let timeout: NodeJS.Timeout | undefined;
+
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+      win.webContents.off('did-finish-load', finish);
+      win.webContents.off('did-fail-load', finish);
+      win.off('closed', finish);
+      resolve();
+    };
+
+    win.webContents.once('did-finish-load', finish);
+    win.webContents.once('did-fail-load', finish);
+    win.once('closed', finish);
+    timeout = setTimeout(finish, 5000);
+    timeout.unref();
+  });
+}
+
+function speakTaskAcknowledgement(api: WorkerApi, win: BrowserWindow, agentId: string, transcript: string): void {
+  const acknowledgement = buildTaskAcknowledgement(transcript);
+  speakWithOpenAiInBackground(api, win, agentId, acknowledgement, 'acknowledgement');
+}
+
+function stripPointTagsForSpeech(text: string): string {
+  return text.replace(/<point\b[^>]*>.*?<\/point>/gis, '').trim();
+}
+
+function stopCursorTracking(reason: string): void {
+  if (!cursorTrackingInterval) return;
+  clearInterval(cursorTrackingInterval);
+  cursorTrackingInterval = undefined;
+  console.log('[clicky:orb] cursor tracking interval cleared', { reason });
+}
+
+function getOrbCursorBounds(width: number, height: number): { x: number; y: number; cursor: Electron.Point; displayId: number } {
+  const cursor = screen.getCursorScreenPoint();
+  const display = screen.getDisplayNearestPoint(cursor);
+  const bounds = display.workArea;
+  const offset = 14;
+
+  const x = Math.max(bounds.x, Math.min(cursor.x + offset, bounds.x + bounds.width - width));
+  const y = Math.max(bounds.y, Math.min(cursor.y + offset, bounds.y + bounds.height - height));
+
+  return { x, y, cursor, displayId: display.id };
 }
 
 function pickAgentColor(): string {
@@ -96,6 +283,11 @@ async function initApp(): Promise<void> {
     model: settings.model,
     selectedCaptureSourceLabel: settings.selectedCaptureSourceLabel,
     email: summarizeEmailConfig(settings.email)
+  });
+  void getCachedTranscribeToken().catch((error) => {
+    console.warn('[clicky:transcribe] realtime token prefetch failed', {
+      error: error instanceof Error ? error.message : String(error)
+    });
   });
 
   session.defaultSession.setDisplayMediaRequestHandler((request, callback) => {
@@ -199,30 +391,22 @@ function handlePushToTalkTrigger(source: string): void {
       safeSend(recorderWindow, ipcChannels.recordingStop);
       console.log('[clicky:hotkey] stop recording sent to orb', { source });
     }
+    stopCursorTracking('hotkey-stop');
     return;
   }
   openRecorderOrb();
 }
 
 function createOrbWindow(): void {
-  const cursor = screen.getCursorScreenPoint();
-  const display = screen.getDisplayNearestPoint(cursor);
   const width = 80;
   const height = 40;
-  const offset = 15;
-
-  let x = cursor.x + offset;
-  let y = cursor.y + offset;
-
-  const bounds = display.workArea;
-  x = Math.max(bounds.x, Math.min(x, bounds.x + bounds.width - width));
-  y = Math.max(bounds.y, Math.min(y, bounds.y + bounds.height - height));
+  const initialBounds = getOrbCursorBounds(width, height);
 
   console.log('[clicky:orb] creating orb window', {
-    cursor,
-    display: display.id,
-    x,
-    y,
+    cursor: initialBounds.cursor,
+    display: initialBounds.displayId,
+    x: initialBounds.x,
+    y: initialBounds.y,
     width,
     height
   });
@@ -230,8 +414,8 @@ function createOrbWindow(): void {
   const win = new BrowserWindow({
     width,
     height,
-    x,
-    y,
+    x: initialBounds.x,
+    y: initialBounds.y,
     frame: false,
     transparent: true,
     alwaysOnTop: true,
@@ -263,6 +447,18 @@ function createOrbWindow(): void {
       win.show();
       win.setIgnoreMouseEvents(true);
       recorderWindowReady = true;
+
+      stopCursorTracking('restart-before-follow');
+      cursorTrackingInterval = setInterval(() => {
+        if (win.isDestroyed()) return;
+        const nextBounds = getOrbCursorBounds(width, height);
+        const currentBounds = win.getBounds();
+        if (currentBounds.x !== nextBounds.x || currentBounds.y !== nextBounds.y) {
+          win.setBounds({ x: nextBounds.x, y: nextBounds.y, width, height }, false);
+        }
+      }, 16);
+      console.log('[clicky:orb] cursor tracking interval started');
+
       // Delay the start message so React has time to mount and register IPC listeners
       setTimeout(() => {
         if (!win.isDestroyed()) {
@@ -276,6 +472,7 @@ function createOrbWindow(): void {
   });
 
   win.on('closed', () => {
+    stopCursorTracking('window-closed');
     windowContexts.delete(winId);
     recorderWindow = undefined;
     recorderWindowReady = false;
@@ -493,6 +690,36 @@ async function getOpenAiApiKey(): Promise<string> {
   return apiKey;
 }
 
+async function getCachedTranscribeToken(): Promise<TranscribeTokenResponse> {
+  const now = Math.floor(Date.now() / 1000);
+  if (cachedTranscribeToken && cachedTranscribeToken.value.expiresAt > now + 60) {
+    console.log('[clicky:transcribe] using cached realtime token', {
+      expiresAt: cachedTranscribeToken.value.expiresAt,
+      ageMs: Date.now() - cachedTranscribeToken.fetchedAt
+    });
+    return cachedTranscribeToken.value;
+  }
+  if (pendingTranscribeToken) {
+    console.log('[clicky:transcribe] awaiting pending realtime token');
+    return pendingTranscribeToken;
+  }
+
+  const api = new WorkerApi({ workerBaseUrl: settings.workerBaseUrl });
+  pendingTranscribeToken = api.getTranscribeToken()
+    .then((token) => {
+      cachedTranscribeToken = { value: token, fetchedAt: Date.now() };
+      console.log('[clicky:transcribe] realtime token fetched', {
+        model: token.model,
+        expiresAt: token.expiresAt
+      });
+      return token;
+    })
+    .finally(() => {
+      pendingTranscribeToken = undefined;
+    });
+  return pendingTranscribeToken;
+}
+
 async function loadDotEnv(): Promise<void> {
   if (envLoaded) return;
   envLoaded = true;
@@ -698,69 +925,72 @@ async function processAgentStream(
     history: request.conversationHistory.length
   });
   let fullResponse = '';
-  for await (const event of api.sendTurn(request)) {
-    console.log('[clicky:agent] stream event received', {
-      agentId,
-      type: event.type,
-      chunkChars: event.text?.length,
-      toolName: event.name
-    });
-    if (event.type === 'chunk' && event.text) {
-      fullResponse += event.text;
-      const commandMatch = event.text.match(/(?:^|\n)(?:\$\s+)?(ls\s+|sed\s+|mkdir\s+|cd\s+|cp\s+|mv\s+|rm\s+|git\s+|npm\s+|pip\s+|python\s+|node\s+)[^\n]+/);
-      if (commandMatch) {
-        state.commands.push(commandMatch[0].trim());
-        console.log('[clicky:agent] command detected in stream', {
-          agentId,
-          command: commandMatch[0].trim()
-        });
-        safeSend(win, ipcChannels.agentCommandFlash, commandMatch[0].trim());
-      }
-      safeSend(win, ipcChannels.chatChunk, event.text);
-    } else if (event.type === 'tool_call' && event.name === 'execute_bash_command') {
-      let args: { command?: string } = {};
-      try {
-        args = event.arguments ? JSON.parse(event.arguments) as { command?: string } : {};
-      } catch {
-        args = {};
-      }
-      const command = args.command;
-      if (command) {
-        state.commands.push(command);
-        console.log('[clicky:agent] executing tool command', { agentId, command });
-        safeSend(win, ipcChannels.agentCommandFlash, command);
+  let chunkCount = 0;
+  let streamedChars = 0;
+  const chatChunks = createChatChunkFlusher(win);
 
-        const result = await executeShellCommand(command);
-        console.log('[clicky:agent] tool command completed', {
-          agentId,
-          stdoutChars: result.stdout.length,
-          stderrChars: result.stderr.length,
-          error: result.error
-        });
+  try {
+    for await (const event of api.sendTurn(request)) {
+      if (event.type === 'chunk' && event.text) {
+        chunkCount++;
+        streamedChars += event.text.length;
+        fullResponse += event.text;
+        const commandMatch = event.text.match(/(?:^|\n)(?:\$\s+)?(ls\s+|sed\s+|mkdir\s+|cd\s+|cp\s+|mv\s+|rm\s+|git\s+|npm\s+|pip\s+|python\s+|node\s+)[^\n]+/);
+        if (commandMatch) {
+          state.commands.push(commandMatch[0].trim());
+          console.log('[clicky:agent] command detected in stream', {
+            agentId,
+            command: commandMatch[0].trim()
+          });
+          safeSend(win, ipcChannels.agentCommandFlash, commandMatch[0].trim());
+        }
+        chatChunks.append(event.text);
+      } else if (event.type === 'tool_call' && event.name === 'execute_bash_command') {
+        chatChunks.flush();
+        let args: { command?: string } = {};
+        try {
+          args = event.arguments ? JSON.parse(event.arguments) as { command?: string } : {};
+        } catch {
+          args = {};
+        }
+        const command = args.command;
+        if (command) {
+          state.commands.push(command);
+          console.log('[clicky:agent] executing tool command', { agentId, command });
+          safeSend(win, ipcChannels.agentCommandFlash, command);
 
-        const toolResultRequest: VoiceTurnRequest = {
-          transcript: `Command executed. Output:\n${result.stdout}\n${result.stderr}${result.error ? `\nError: ${result.error}` : ''}`.trim(),
-          captures: [],
-          model: request.model,
-          conversationHistory: [
-            ...request.conversationHistory,
-            { role: 'user', content: request.transcript },
-            { role: 'assistant', content: fullResponse }
-          ],
-          agentId
-        };
+          const result = await executeShellCommand(command);
+          console.log('[clicky:agent] tool command completed', {
+            agentId,
+            stdoutChars: result.stdout.length,
+            stderrChars: result.stderr.length,
+            error: result.error
+          });
 
-        await processAgentStream(api, toolResultRequest, win, state, agentId);
-        return;
-      }
-    } else if (event.type === 'tool_call' && event.name === 'write_file') {
-      console.log('[clicky:agent] TOOL_CALL write_file RECEIVED', { agentId, argsChars: event.arguments?.length ?? 0 });
-      let args: { file_path?: string; content?: string } = {};
-      try {
-        args = event.arguments ? JSON.parse(event.arguments) as { file_path?: string; content?: string } : {};
-      } catch {
-        args = {};
-      }
+          const toolResultRequest: VoiceTurnRequest = {
+            transcript: `Command executed. Output:\n${result.stdout}\n${result.stderr}${result.error ? `\nError: ${result.error}` : ''}`.trim(),
+            captures: [],
+            model: request.model,
+            conversationHistory: [
+              ...request.conversationHistory,
+              { role: 'user', content: request.transcript },
+              { role: 'assistant', content: fullResponse }
+            ],
+            agentId
+          };
+
+          await processAgentStream(api, toolResultRequest, win, state, agentId);
+          return;
+        }
+      } else if (event.type === 'tool_call' && event.name === 'write_file') {
+        chatChunks.flush();
+        console.log('[clicky:agent] TOOL_CALL write_file RECEIVED', { agentId, argsChars: event.arguments?.length ?? 0 });
+        let args: { file_path?: string; content?: string } = {};
+        try {
+          args = event.arguments ? JSON.parse(event.arguments) as { file_path?: string; content?: string } : {};
+        } catch {
+          args = {};
+        }
 
       const filePath = args.file_path;
       const content = args.content;
@@ -796,6 +1026,7 @@ async function processAgentStream(
         return;
       }
     } else if (event.type === 'tool_call' && event.name === 'check_email') {
+      chatChunks.flush();
       console.log('[clicky:agent] TOOL_CALL check_email RECEIVED', { agentId, args: event.arguments });
       let args: { count?: number } = {};
       try {
@@ -855,6 +1086,7 @@ async function processAgentStream(
         return;
       }
     } else if (event.type === 'tool_call' && event.name === 'open_url') {
+      chatChunks.flush();
       console.log('[clicky:agent] TOOL_CALL open_url RECEIVED', { agentId, args: event.arguments });
       let args: { url?: string } = {};
       try {
@@ -900,6 +1132,7 @@ async function processAgentStream(
         }
       }
     } else if (event.type === 'tool_call' && event.name === 'scrape_website') {
+      chatChunks.flush();
       console.log('[clicky:agent] TOOL_CALL scrape_website RECEIVED', { agentId, args: event.arguments });
       let args: { url?: string; extractMode?: string; maxChars?: number } = {};
       try {
@@ -950,6 +1183,7 @@ async function processAgentStream(
         }
       }
     } else if (event.type === 'tool_call' && event.name === 'download_email_attachment') {
+      chatChunks.flush();
       console.log('[clicky:agent] TOOL_CALL download_email_attachment RECEIVED', { agentId, args: event.arguments });
       let args: { email_number?: number; filename?: string } = {};
       try {
@@ -1016,6 +1250,7 @@ async function processAgentStream(
         return;
       }
     } else if (event.type === 'done') {
+      chatChunks.flush();
       state.status = 'done';
       state.response = fullResponse;
       state.summary = fullResponse.slice(0, 200) + (fullResponse.length > 200 ? '...' : '');
@@ -1029,23 +1264,18 @@ async function processAgentStream(
       console.log('[clicky:agent] stream done', {
         agentId,
         responseChars: fullResponse.length,
+        chunks: chunkCount,
+        streamedChars,
         commands: state.commands.length,
         actions: state.actions.map((action) => action.label)
       });
       safeSend(win, ipcChannels.chatDone);
       safeSend(win, ipcChannels.agentUpdate, state);
       if (fullResponse) {
-        try {
-          console.log('[clicky:agent] requesting TTS audio', { agentId, chars: fullResponse.length });
-          const audio = await api.synthesizeSpeech(fullResponse);
-          safeSend(win, ipcChannels.ttsAudio, audio);
-          console.log('[clicky:agent] TTS audio sent', { agentId, bytes: audio.byteLength });
-        } catch {
-          console.warn('[clicky:agent] TTS synthesis failed', { agentId });
-          void 0;
-        }
+        speakWithOpenAiInBackground(api, win, agentId, fullResponse, 'response');
       }
     } else if (event.type === 'error' && event.error) {
+      chatChunks.flush();
       state.status = 'error';
       state.error = event.error;
       console.error('[clicky:agent] stream error', { agentId, error: event.error });
@@ -1053,9 +1283,17 @@ async function processAgentStream(
       safeSend(win, ipcChannels.agentUpdate, state);
     }
   }
+  } finally {
+    chatChunks.dispose();
+  }
 }
 
 ipcMain.handle(ipcChannels.settingsGet, () => settings);
+ipcMain.on(ipcChannels.recordingStopped, (event) => {
+  if (event.sender.id !== recorderWindow?.webContents.id) return;
+  stopCursorTracking('recording-stopped');
+});
+
 ipcMain.handle(ipcChannels.settingsSet, async (_event, next: AppSettings) => {
   settings = await saveSettings(next);
   return settings;
@@ -1195,8 +1433,12 @@ ipcMain.handle(ipcChannels.audioTranscribe, async (_event, audio: RecordedAudioP
 });
 
 ipcMain.handle(ipcChannels.transcribeGetToken, async () => {
+  return getCachedTranscribeToken();
+});
+
+ipcMain.handle(ipcChannels.realtimeCreateCall, async (_event, offerSdp: string) => {
   const api = new WorkerApi({ workerBaseUrl: settings.workerBaseUrl });
-  return api.getTranscribeToken();
+  return api.createRealtimeTranscriptionCall(offerSdp);
 });
 
 ipcMain.handle(ipcChannels.ttsSpeak, async (_event, text: string, agentId?: string) => {
@@ -1246,6 +1488,8 @@ ipcMain.handle(ipcChannels.agentSpawn, async (_event, request: VoiceTurnRequest)
 
   const api = new WorkerApi({ workerBaseUrl: settings.workerBaseUrl });
   try {
+    await waitForWindowLoad(win);
+    speakTaskAcknowledgement(api, win, agentId, request.transcript);
     await processAgentStream(api, { ...request, agentId }, win, state, agentId);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -1356,6 +1600,7 @@ ipcMain.handle(ipcChannels.agentFollowUp, async (_event, agentId: string, reques
 
   const api = new WorkerApi({ workerBaseUrl: settings.workerBaseUrl });
   try {
+    speakTaskAcknowledgement(api, win, agentId, request.transcript);
     await processAgentStream(api, { ...request, agentId }, win, state, agentId);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -1371,6 +1616,7 @@ if (hasSingleInstanceLock) {
   app.whenReady().then(initApp);
 }
 app.on('will-quit', () => {
+  stopCursorTracking('app-quit');
   if (keepAliveTimer) {
     clearInterval(keepAliveTimer);
     keepAliveTimer = undefined;

@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer } from 'electron';
 import { ipcChannels } from '../shared/ipcChannels';
-import type { AppSettings, CaptureSource, ScreenCapturePayload, ShellResult, TranscribeTokenResponse, VoiceTurnRequest, WindowContext, AgentState, AgentAction, RecordedAudioPayload } from '../shared/types';
+import type { AppSettings, CaptureSource, ScreenCapturePayload, ShellResult, TranscribeTokenResponse, VoiceTurnRequest, WindowContext, AgentState, AgentAction, RecordedAudioPayload, RealtimeCallResponse } from '../shared/types';
 
 const api = {
   getSettings: (): Promise<AppSettings> => ipcRenderer.invoke(ipcChannels.settingsGet),
@@ -12,7 +12,9 @@ const api = {
   sendTurn: (request: VoiceTurnRequest): Promise<void> => ipcRenderer.invoke(ipcChannels.chatSendTurn, request),
   transcribeAudio: (payload: RecordedAudioPayload): Promise<string> => ipcRenderer.invoke(ipcChannels.audioTranscribe, payload),
   getTranscribeToken: (): Promise<TranscribeTokenResponse> => ipcRenderer.invoke(ipcChannels.transcribeGetToken),
+  createRealtimeCall: (offerSdp: string): Promise<RealtimeCallResponse> => ipcRenderer.invoke(ipcChannels.realtimeCreateCall, offerSdp),
   speak: (text: string, agentId?: string): Promise<void> => ipcRenderer.invoke(ipcChannels.ttsSpeak, text, agentId),
+  notifyRecordingStopped: (): void => ipcRenderer.send(ipcChannels.recordingStopped),
   spawnAgent: (request: VoiceTurnRequest): Promise<string> => ipcRenderer.invoke(ipcChannels.agentSpawn, request),
   spawnAgentError: (message: string): Promise<string> => ipcRenderer.invoke(ipcChannels.agentSpawnError, message),
   closeAgent: (agentId: string): Promise<void> => ipcRenderer.invoke(ipcChannels.agentClose, agentId),

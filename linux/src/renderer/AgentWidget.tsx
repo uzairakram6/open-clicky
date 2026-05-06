@@ -4,6 +4,8 @@ import type { AgentState, AgentAction, ScreenCapturePayload } from '../shared/ty
 import { playAudioBytes } from './playAudio';
 import { useVoiceRecorder } from './useVoiceRecorder';
 
+type ArrivalPhase = 'spawning' | 'materializing' | 'traveling' | 'settled';
+
 export interface AgentWidgetProps {
   agentId: string;
   color?: string;
@@ -69,10 +71,37 @@ export function AgentWidget({ agentId, color }: AgentWidgetProps) {
   const [followUpText, setFollowUpText] = useState('');
   const [isTerminalVisible, setIsTerminalVisible] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
+  const [arrivalPhase, setArrivalPhase] = useState<ArrivalPhase>('spawning');
+  const hasArrivedRef = useRef(false);
   const flashTimeoutRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const pendingResponseRef = useRef('');
+  const responseFlushTimeoutRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const realtimeFinalTranscriptRef = useRef('');
   const { transcript, level, isRecording, startRecording, stopRecording } = useVoiceRecorder();
 
   useEffect(() => {
+    const flushPendingResponse = () => {
+      if (responseFlushTimeoutRef.current) {
+        clearTimeout(responseFlushTimeoutRef.current);
+        responseFlushTimeoutRef.current = undefined;
+      }
+      const pending = pendingResponseRef.current;
+      if (!pending) return;
+      pendingResponseRef.current = '';
+      setResponse((current) => stripPointTags(`${current}${pending}`));
+    };
+
+    const queueResponseChunk = (text: string) => {
+      pendingResponseRef.current += text;
+      if (pendingResponseRef.current.length >= 160) {
+        flushPendingResponse();
+        return;
+      }
+      if (!responseFlushTimeoutRef.current) {
+        responseFlushTimeoutRef.current = setTimeout(flushPendingResponse, 50);
+      }
+    };
+
     const disposers = [
       window.clicky.onAgentUpdate((state) => {
         if (state.id === agentId) {
@@ -80,9 +109,10 @@ export function AgentWidget({ agentId, color }: AgentWidgetProps) {
         }
       }),
       window.clicky.onChatChunk((text) => {
-        setResponse((current) => stripPointTags(`${current}${text}`));
+        queueResponseChunk(text);
       }),
       window.clicky.onChatDone(() => {
+        flushPendingResponse();
         setResponse((current) => {
           const clean = stripPointTags(current);
           return clean;
@@ -108,8 +138,33 @@ export function AgentWidget({ agentId, color }: AgentWidgetProps) {
       if (flashTimeoutRef.current) {
         clearTimeout(flashTimeoutRef.current);
       }
+      if (responseFlushTimeoutRef.current) {
+        clearTimeout(responseFlushTimeoutRef.current);
+        responseFlushTimeoutRef.current = undefined;
+      }
+      pendingResponseRef.current = '';
     };
   }, [agentId]);
+
+  useEffect(() => {
+    if (hasArrivedRef.current) return;
+    hasArrivedRef.current = true;
+
+    setArrivalPhase('spawning');
+
+    const materializeTimer = setTimeout(() => {
+      setArrivalPhase('materializing');
+    }, 400);
+
+    const settleTimer = setTimeout(() => {
+      setArrivalPhase('settled');
+    }, 900);
+
+    return () => {
+      clearTimeout(materializeTimer);
+      clearTimeout(settleTimer);
+    };
+  }, []);
 
   const status = agent?.status ?? 'running';
   const isDone = status === 'done';
@@ -148,12 +203,18 @@ export function AgentWidget({ agentId, color }: AgentWidgetProps) {
     let text = followUpText;
     if (followUpMode === 'voice') {
       const audio = await stopRecording();
-      if (!audio) return;
-      try {
-        text = await window.clicky.transcribeAudio(audio);
-      } catch (err) {
-        setError('Transcription Failed: Please check your OpenAI API key or internet connection');
-        return;
+      const realtimeTranscript = realtimeFinalTranscriptRef.current;
+      realtimeFinalTranscriptRef.current = '';
+
+      if (realtimeTranscript) {
+        text = realtimeTranscript;
+      } else if (audio) {
+        try {
+          text = await window.clicky.transcribeAudio(audio);
+        } catch (err) {
+          setError('Transcription Failed: Please check your OpenAI API key or internet connection');
+          return;
+        }
       }
     }
     if (!text.trim()) return;
@@ -182,10 +243,20 @@ export function AgentWidget({ agentId, color }: AgentWidgetProps) {
   const startVoiceFollowUp = useCallback(async () => {
     setFollowUpMode('voice');
     setResponse('');
+    realtimeFinalTranscriptRef.current = '';
+
     await startRecording({
       silenceMs: 2000,
+      useRealtime: true,
       onSilence: () => {
         void submitFollowUp();
+      },
+      onFinalTranscript: (text) => {
+        realtimeFinalTranscriptRef.current = text;
+        void submitFollowUp();
+      },
+      onRealtimeError: (message) => {
+        console.error('[clicky:agent] realtime transcription error:', message);
       }
     });
   }, [startRecording, submitFollowUp]);
@@ -224,14 +295,19 @@ export function AgentWidget({ agentId, color }: AgentWidgetProps) {
 
   const statusPillLabel = isError ? 'Error' : isDone ? 'Done' : 'Working';
 
+  const arrivalClass = arrivalPhase === 'settled' ? 'phase-settled' : `phase-${arrivalPhase}`;
+
   return (
     <div
-      className={`agent-widget ${isExpanded ? 'expanded' : 'minimized'} ${isError ? 'status-error' : ''}`}
+      className={`agent-widget ${isExpanded ? 'expanded' : 'minimized'} ${isError ? 'status-error' : isDone ? 'status-done' : 'status-running'} ${arrivalClass}`}
       style={{ '--agent-color': color ?? '#34C759' } as React.CSSProperties}
     >
       <button type="button" className="agent-mini" onClick={expandWidget} aria-label="Open agent details">
         <span className={`mini-status ${status}`} />
-        <span className="mini-triangle" />
+        <span className="arrival-spinner" />
+        <span className="mini-triangle-wrapper">
+          <span className="mini-triangle" />
+        </span>
       </button>
 
       <header className="agent-header">

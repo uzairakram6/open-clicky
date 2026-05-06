@@ -3,12 +3,12 @@ import type { ScreenCapturePayload } from '../shared/types';
 import { useVoiceRecorder } from './useVoiceRecorder';
 
 export function Recorder() {
-  const { level, isRecording, startRecording, stopRecording } = useVoiceRecorder();
+  const { transcript, level, isRecording, startRecording, stopRecording } = useVoiceRecorder();
   const isRecordingRef = useRef(isRecording);
   const startRecordingRef = useRef(startRecording);
   const stopRecordingRef = useRef(stopRecording);
-  const captureRef = useRef<ScreenCapturePayload | undefined>(undefined);
   const isStoppingRef = useRef(false);
+  const realtimeFinalTranscriptRef = useRef('');
   const [status, setStatus] = useState<'idle' | 'listening' | 'processing'>('idle');
 
   useEffect(() => {
@@ -44,47 +44,58 @@ export function Recorder() {
     setStatus('processing');
     console.log('[clicky:orb] stopping active recording', { reason });
     const audio = await stopRecordingRef.current();
-    if (!audio) {
-      console.warn('[clicky:orb] no audio payload returned; closing orb');
+    window.clicky.notifyRecordingStopped();
+
+    let finalTranscript = realtimeFinalTranscriptRef.current;
+    realtimeFinalTranscriptRef.current = '';
+
+    if (finalTranscript) {
+      console.log('[clicky:orb] using Realtime final transcript', {
+        chars: finalTranscript.length,
+        transcript: finalTranscript
+      });
+    } else if (audio) {
+      console.log('[clicky:orb] falling back to Whisper transcription', {
+        bytes: audio.bytes.byteLength,
+        mimeType: audio.mimeType
+      });
+      try {
+        finalTranscript = await window.clicky.transcribeAudio(audio);
+        console.log('[clicky:orb] Whisper transcription received', {
+          chars: finalTranscript.length,
+          transcript: finalTranscript
+        });
+      } catch (err) {
+        console.error('[clicky:orb] Whisper transcription failed:', err);
+        await window.clicky.spawnAgentError('Transcription Failed: Please check your OpenAI API key or internet connection');
+        window.close();
+        return;
+      }
+    }
+
+    if (!finalTranscript?.trim()) {
+      console.warn('[clicky:orb] empty transcript; closing orb');
       window.close();
       return;
     }
 
     const settings = await window.clicky.getSettings();
-    const captures = captureRef.current ? [captureRef.current] : [];
-    captureRef.current = undefined;
-    console.log('[clicky:orb] sending audio for Whisper transcription', {
-      bytes: audio.bytes.byteLength,
-      mimeType: audio.mimeType,
-      captures: captures.length
-    });
+    const captures = await captureScreenIfUseful(finalTranscript);
 
+    const request = {
+      transcript: finalTranscript.trim(),
+      captures,
+      model: settings.model,
+      conversationHistory: []
+    };
+
+    console.log('[clicky:orb] spawning agent from transcript');
     try {
-      const finalTranscript = await window.clicky.transcribeAudio(audio);
-      console.log('[clicky:orb] Whisper transcription received', {
-        chars: finalTranscript.length,
-        transcript: finalTranscript
-      });
-
-      if (!finalTranscript.trim()) {
-        console.warn('[clicky:orb] Whisper returned an empty transcript; closing orb');
-        window.close();
-        return;
-      }
-
-      const request = {
-        transcript: finalTranscript.trim(),
-        captures,
-        model: settings.model,
-        conversationHistory: []
-      };
-
-      console.log('[clicky:orb] spawning agent from transcript');
       await window.clicky.spawnAgent(request);
       console.log('[clicky:orb] agent spawn IPC completed');
     } catch (err) {
-      console.error('[clicky:orb] Whisper transcription or agent spawn failed:', err);
-      await window.clicky.spawnAgentError('Transcription Failed: Please check your OpenAI API key or internet connection');
+      console.error('[clicky:orb] agent spawn failed:', err);
+      await window.clicky.spawnAgentError('Agent spawn failed');
     }
 
     console.log('[clicky:orb] closing recorder window after handoff');
@@ -97,29 +108,47 @@ export function Recorder() {
       return;
     }
     isStoppingRef.current = false;
+    realtimeFinalTranscriptRef.current = '';
     console.log('[clicky:orb] wake word handoff received; starting command recording');
-    captureRef.current = undefined;
+    setStatus('listening');
+
+    console.log('[clicky:orb] starting microphone recording with silence auto-stop');
+    await startRecordingRef.current({
+      silenceMs: 2000,
+      useRealtime: true,
+      onSilence: () => {
+        void stopAndHandoff('silence-timeout');
+      },
+      onFinalTranscript: (text) => {
+        realtimeFinalTranscriptRef.current = text;
+        void stopAndHandoff('realtime-final');
+      },
+      onRealtimeError: (message) => {
+        console.error('[clicky:orb] realtime transcription error:', message);
+      }
+    });
+    console.log('[clicky:orb] microphone recording started');
+  }
+
+  async function captureScreenIfUseful(transcriptText: string): Promise<ScreenCapturePayload[]> {
+    if (!shouldCaptureScreen(transcriptText)) {
+      console.log('[clicky:orb] screen context skipped for transcript');
+      return [];
+    }
+
+    console.log('[clicky:orb] capturing screen context after transcript');
     try {
-      console.log('[clicky:orb] capturing screen context before recording');
-      const capture = await window.clicky.takeScreenshot();
-      captureRef.current = capture;
-      console.log('[clicky:orb] background screenshot captured', {
+      const capture = await withTimeout(window.clicky.takeScreenshot(), 1200);
+      console.log('[clicky:orb] screen context captured', {
         label: capture.label,
         width: capture.width,
         height: capture.height
       });
+      return [capture];
     } catch (err) {
-      console.error('[clicky:orb] background screenshot failed:', err);
+      console.error('[clicky:orb] screen context capture failed:', err);
+      return [];
     }
-    setStatus('listening');
-    console.log('[clicky:orb] starting microphone recording with silence auto-stop');
-    await startRecordingRef.current({
-      silenceMs: 2000,
-      onSilence: () => {
-        void stopAndHandoff('silence-timeout');
-      }
-    });
-    console.log('[clicky:orb] microphone recording started');
   }
 
   return (
@@ -146,6 +175,27 @@ export function Recorder() {
           </div>
         ) : null}
       </div>
+
     </div>
   );
+}
+
+function shouldCaptureScreen(transcript: string): boolean {
+  return /\b(this|that|screen|page|window|image|picture|what (?:is|are)|what's|look|see|visible|shown|displayed|about)\b/i.test(transcript);
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error(`Timed out after ${timeoutMs}ms`)), timeoutMs);
+    void promise.then(
+      (value) => {
+        clearTimeout(timeout);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      }
+    );
+  });
 }

@@ -75,7 +75,15 @@ export interface CaptureSource {
 
 export interface TranscribeTokenResponse {
   token: string;
-  expiresAt?: string;
+  expiresAt: number;
+  websocketUrl: string;
+  model: "gpt-4o-mini-transcribe";
+  sampleRate: 24000;
+}
+
+export interface RealtimeCallResponse {
+  answerSdp: string;
+  callId?: string;
 }
 
 export interface RecordedAudioPayload {

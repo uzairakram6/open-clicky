@@ -1,6 +1,6 @@
 import { useCallback, useRef, useState } from 'react';
-import { floatToPcm16, int16ToBase64 } from '../shared/audio';
-import type { RecordedAudioPayload } from '../shared/types';
+import { OpenAIRealtimeTranscriber } from './transcriber';
+import type { RecordedAudioPayload, TranscribeTokenResponse } from '../shared/types';
 
 export interface VoiceRecorderState {
   transcript: string;
@@ -12,6 +12,11 @@ export interface StartRecordingOptions {
   onSilence?: () => void;
   silenceMs?: number;
   silenceThreshold?: number;
+  onPartialTranscript?: (text: string) => void;
+  onFinalTranscript?: (text: string) => void;
+  onRealtimeError?: (message: string) => void;
+  useRealtime?: boolean;
+  transcribeToken?: TranscribeTokenResponse;
 }
 
 export function useVoiceRecorder() {
@@ -26,6 +31,7 @@ export function useVoiceRecorder() {
   const silenceStartedAtRef = useRef<number | undefined>(undefined);
   const silenceTriggeredRef = useRef(false);
   const optionsRef = useRef<StartRecordingOptions>({});
+  const transcriberRef = useRef<OpenAIRealtimeTranscriber | undefined>(undefined);
 
   const startRecording = useCallback(async (options: StartRecordingOptions = {}) => {
     console.log('[clicky:recorder] startRecording requested');
@@ -70,14 +76,44 @@ export function useVoiceRecorder() {
     const samples = new Float32Array(analyser.fftSize);
     source.connect(analyser);
 
+    if (options.useRealtime || options.transcribeToken) {
+      const transcriber = new OpenAIRealtimeTranscriber({
+        model: options.transcribeToken?.model ?? 'gpt-4o-mini-transcribe',
+        sampleRate: options.transcribeToken?.sampleRate ?? 24000,
+        onPartialTranscript: (text) => {
+          setTranscript((current) => {
+            const updated = current + text;
+            options.onPartialTranscript?.(updated);
+            return updated;
+          });
+        },
+        onFinalTranscript: (text) => {
+          setTranscript(text);
+          options.onFinalTranscript?.(text);
+        },
+        onError: (message) => {
+          console.error('[clicky:recorder] realtime transcriber error:', message);
+          options.onRealtimeError?.(message);
+        }
+      });
+      transcriberRef.current = transcriber;
+      try {
+        await transcriber.start(stream);
+        console.log('[clicky:recorder] realtime transcriber connected');
+      } catch (err) {
+        console.error('[clicky:recorder] realtime transcriber connection failed:', err);
+        options.onRealtimeError?.('Failed to connect to realtime transcription');
+        transcriberRef.current = undefined;
+      }
+    }
+
     const tick = () => {
       if (!streamRef.current) {
         void context.close();
         return;
       }
       analyser.getFloatTimeDomainData(samples);
-      const pcm = floatToPcm16(samples);
-      int16ToBase64(pcm.slice(0, 8));
+
       const peak = samples.reduce((max, sample) => Math.max(max, Math.abs(sample)), 0);
       setLevel(Math.min(1, peak * 3));
       handleSilence(peak);
@@ -107,6 +143,17 @@ export function useVoiceRecorder() {
     await stopped;
     console.log('[clicky:recorder] MediaRecorder stopped');
     recorderRef.current = undefined;
+
+    const finalTranscript = await transcriberRef.current?.finish();
+    if (finalTranscript) {
+      console.log('[clicky:recorder] realtime transcription final received during stop', {
+        chars: finalTranscript.length
+      });
+    } else if (transcriberRef.current) {
+      console.warn('[clicky:recorder] realtime transcription final not received before timeout');
+    }
+    transcriberRef.current?.close();
+    transcriberRef.current = undefined;
 
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = undefined;

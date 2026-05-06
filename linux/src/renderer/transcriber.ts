@@ -1,59 +1,122 @@
-import { floatToPcm16, int16ToBase64 } from '../shared/audio';
-
-export interface AssemblyTranscriberOptions {
-  token: string;
+export interface RealtimeTranscriberOptions {
+  model: string;
+  sampleRate: number;
   onPartialTranscript: (text: string) => void;
   onFinalTranscript: (text: string) => void;
   onError: (message: string) => void;
 }
 
-export class AssemblyTranscriber {
-  private context?: AudioContext;
-  private processor?: ScriptProcessorNode;
-  private source?: MediaStreamAudioSourceNode;
-  private socket?: WebSocket;
+export class OpenAIRealtimeTranscriber {
+  private pc?: RTCPeerConnection;
+  private dataChannel?: RTCDataChannel;
+  private ready = false;
+  private finalTranscript = '';
+  private finalWaiters: Array<(text: string | undefined) => void> = [];
 
-  constructor(private readonly options: AssemblyTranscriberOptions) {}
+  constructor(private readonly options: RealtimeTranscriberOptions) {}
 
   async start(stream: MediaStream): Promise<void> {
-    this.socket = new WebSocket(`wss://api.assemblyai.com/v2/realtime/ws?sample_rate=16000&token=${encodeURIComponent(this.options.token)}`);
-    this.socket.addEventListener('message', (event) => this.handleMessage(event));
-    this.socket.addEventListener('error', () => this.options.onError('AssemblyAI transcription socket failed'));
+    this.pc = new RTCPeerConnection();
+    this.dataChannel = this.pc.createDataChannel('oai-events');
+    this.dataChannel.addEventListener('message', (event) => this.handleMessage(event));
+    this.dataChannel.addEventListener('error', () => this.options.onError('Realtime transcription data channel failed'));
+
+    for (const track of stream.getAudioTracks()) {
+      this.pc.addTrack(track, stream);
+    }
+
+    const offer = await this.pc.createOffer();
+    await this.pc.setLocalDescription(offer);
+    const answer = await window.clicky.createRealtimeCall(offer.sdp ?? '');
+    await this.pc.setRemoteDescription({ type: 'answer', sdp: answer.answerSdp });
 
     await new Promise<void>((resolve, reject) => {
-      if (!this.socket) return reject(new Error('Socket was not created'));
-      this.socket.addEventListener('open', () => resolve(), { once: true });
-      this.socket.addEventListener('error', () => reject(new Error('Unable to open AssemblyAI transcription socket')), { once: true });
-    });
+      const timeout = setTimeout(() => {
+        cleanup();
+        reject(new Error('Timed out waiting for Realtime WebRTC connection'));
+      }, 8000);
 
-    this.context = new AudioContext({ sampleRate: 16000 });
-    this.source = this.context.createMediaStreamSource(stream);
-    this.processor = this.context.createScriptProcessor(4096, 1, 1);
-    this.processor.onaudioprocess = (event) => {
-      const pcm = floatToPcm16(event.inputBuffer.getChannelData(0));
-      this.send({ audio_data: int16ToBase64(pcm) });
-    };
-    this.source.connect(this.processor);
-    this.processor.connect(this.context.destination);
+      const cleanup = () => {
+        clearTimeout(timeout);
+        this.pc?.removeEventListener('connectionstatechange', onStateChange);
+      };
+
+      const onStateChange = () => {
+        if (this.pc?.connectionState === 'connected') {
+          cleanup();
+          resolve();
+        } else if (this.pc?.connectionState === 'failed' || this.pc?.connectionState === 'closed') {
+          cleanup();
+          reject(new Error(`Realtime WebRTC connection ${this.pc.connectionState}`));
+        }
+      };
+
+      this.pc?.addEventListener('connectionstatechange', onStateChange);
+      onStateChange();
+    });
   }
 
-  async stop(): Promise<void> {
-    this.send({ terminate_session: true });
-    this.processor?.disconnect();
-    this.source?.disconnect();
-    await this.context?.close();
-    this.socket?.close();
+  commit(): void {
+    this.pc?.getSenders().forEach((sender) => {
+      if (sender.track?.kind === 'audio') {
+        sender.track.enabled = false;
+      }
+    });
+  }
+
+  finish(timeoutMs = 1600): Promise<string | undefined> {
+    this.commit();
+    if (this.finalTranscript) {
+      return Promise.resolve(this.finalTranscript);
+    }
+
+    return new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        this.finalWaiters = this.finalWaiters.filter((waiter) => waiter !== resolve);
+        resolve(undefined);
+      }, timeoutMs);
+
+      this.finalWaiters.push((text) => {
+        clearTimeout(timeout);
+        resolve(text);
+      });
+    });
+  }
+
+  close(): void {
+    this.pc?.getSenders().forEach((sender) => sender.track?.stop());
+    this.dataChannel?.close();
+    this.pc?.close();
+    this.ready = false;
+  }
+
+  get readyState(): number {
+    if (!this.pc || this.pc.connectionState === 'closed') return WebSocket.CLOSED;
+    if (this.pc.connectionState === 'connected') return WebSocket.OPEN;
+    if (this.pc.connectionState === 'connecting' || this.pc.connectionState === 'new') return WebSocket.CONNECTING;
+    return WebSocket.CLOSING;
   }
 
   private handleMessage(event: MessageEvent<string>): void {
     try {
-      const payload = JSON.parse(event.data) as { message_type?: string; text?: string; error?: string };
-      if (payload.error) {
-        this.options.onError(payload.error);
-      } else if (payload.message_type === 'PartialTranscript' && payload.text) {
-        this.options.onPartialTranscript(payload.text);
-      } else if (payload.message_type === 'FinalTranscript' && payload.text) {
-        this.options.onFinalTranscript(payload.text);
+      const payload = JSON.parse(event.data) as {
+        type?: string;
+        delta?: string;
+        transcript?: string;
+        error?: { message?: string };
+      };
+      if (payload.type === 'session.created' || payload.type === 'transcription_session.created') {
+        this.ready = true;
+      } else if (payload.type === 'conversation.item.input_audio_transcription.delta' && payload.delta) {
+        this.options.onPartialTranscript(payload.delta);
+      } else if (payload.type === 'conversation.item.input_audio_transcription.completed' && payload.transcript) {
+        this.finalTranscript = payload.transcript;
+        this.options.onFinalTranscript(payload.transcript);
+        const waiters = this.finalWaiters;
+        this.finalWaiters = [];
+        waiters.forEach((resolve) => resolve(payload.transcript));
+      } else if (payload.type === 'error') {
+        this.options.onError(payload.error?.message ?? 'Realtime transcription error');
       }
     } catch {
       this.options.onError('Malformed transcription message');
@@ -61,8 +124,8 @@ export class AssemblyTranscriber {
   }
 
   private send(payload: unknown): void {
-    if (this.socket?.readyState === WebSocket.OPEN) {
-      this.socket.send(JSON.stringify(payload));
+    if (this.dataChannel?.readyState === 'open') {
+      this.dataChannel.send(JSON.stringify(payload));
     }
   }
 }

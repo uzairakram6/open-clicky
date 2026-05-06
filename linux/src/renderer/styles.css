@@ -9,6 +9,10 @@ body, html {
   background-color: transparent !important;
 }
 
+body {
+  transition: all 0.05s ease-out;
+}
+
 button, input, select, textarea {
   font: inherit;
 }
@@ -119,8 +123,9 @@ button, input, select, textarea {
 }
 
 .mini-status.done {
-  background: #0A84FF;
-  box-shadow: 0 0 4px 1px rgba(10, 132, 255, 0.35);
+  background: var(--agent-color);
+  box-shadow: 0 0 4px 1px color-mix(in srgb, var(--agent-color) 35%, transparent);
+  animation: none;
 }
 
 .mini-status.error {
@@ -141,6 +146,190 @@ button, input, select, textarea {
 .agent-widget.status-error .mini-triangle {
   border-bottom-color: #ff453a;
   filter: drop-shadow(0 0 8px rgba(255, 69, 58, 0.5));
+}
+
+/* ── Arrival spinner ── */
+.arrival-spinner {
+  position: absolute;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: conic-gradient(
+    from 0deg,
+    transparent 0%,
+    color-mix(in srgb, var(--agent-color) 70%, transparent) 50%,
+    transparent 100%
+  );
+  mask: radial-gradient(circle, transparent 35%, black 36%);
+  -webkit-mask: radial-gradient(circle, transparent 35%, black 36%);
+  animation: arrival-spin 0.8s linear infinite, arrival-pulse-opacity 0.8s ease-in-out infinite alternate;
+  opacity: 0;
+  pointer-events: none;
+  z-index: 3;
+}
+
+.agent-widget.phase-spawning .arrival-spinner {
+  opacity: 1;
+}
+
+.agent-widget.phase-materializing .arrival-spinner {
+  animation: arrival-spin 0.8s linear infinite, arrival-fade-out 0.5s ease-out forwards;
+}
+
+.agent-widget.phase-settled .arrival-spinner,
+.agent-widget.phase-traveling .arrival-spinner {
+  opacity: 0;
+  pointer-events: none;
+}
+
+@keyframes arrival-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+@keyframes arrival-pulse-opacity {
+  from { opacity: 0.4; }
+  to { opacity: 1; }
+}
+
+@keyframes arrival-fade-out {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+
+/* ── Mini triangle wrapper for glow ── */
+.mini-triangle-wrapper {
+  position: relative;
+  display: grid;
+  place-items: center;
+}
+
+.mini-triangle-wrapper::after {
+  content: '';
+  position: absolute;
+  inset: -6px;
+  border-radius: 50%;
+  background: radial-gradient(circle, color-mix(in srgb, var(--agent-color) 30%, transparent), transparent 70%);
+  opacity: 0;
+  pointer-events: none;
+  z-index: -1;
+  animation: glow-breathe 3s ease-in-out infinite;
+}
+
+.agent-widget.status-error .mini-triangle-wrapper::after {
+  background: radial-gradient(circle, color-mix(in srgb, #ff453a 30%, transparent), transparent 70%);
+}
+
+/* Phase-based glow visibility */
+.agent-widget.phase-spawning .mini-triangle-wrapper::after {
+  opacity: 0;
+  animation: none;
+}
+
+.agent-widget.phase-materializing .mini-triangle-wrapper::after {
+  animation: materialize-burst 0.5s ease-out forwards, glow-breathe 3s ease-in-out infinite;
+}
+
+.agent-widget.phase-settled .mini-triangle-wrapper::after {
+  opacity: 1;
+  animation: glow-breathe 3s ease-in-out infinite;
+}
+
+/* Phase-based triangle visibility */
+.agent-widget.phase-spawning .mini-triangle {
+  opacity: 0;
+  filter: none;
+}
+
+.agent-widget.phase-materializing .mini-triangle {
+  animation: triangle-fade-in 0.5s ease-out forwards;
+}
+
+.agent-widget.phase-settled .mini-triangle {
+  opacity: 1;
+}
+
+/* ── Status-based glow variations ── */
+.agent-widget.status-running .mini-triangle-wrapper::after {
+  animation: glow-breathe 1.5s ease-in-out infinite;
+}
+
+.agent-widget.status-done .mini-triangle-wrapper::after {
+  animation: glow-breathe 4s ease-in-out infinite;
+}
+
+.agent-widget.status-error .mini-triangle-wrapper::after {
+  animation: glow-breathe 2s ease-in-out infinite;
+}
+
+/* ── Hover glow intensification ── */
+.agent-mini:hover .mini-triangle-wrapper::after {
+  background: radial-gradient(circle, color-mix(in srgb, var(--agent-color) 50%, transparent), transparent 70%);
+  inset: -10px;
+}
+
+.agent-widget.status-error .agent-mini:hover .mini-triangle-wrapper::after {
+  background: radial-gradient(circle, color-mix(in srgb, #ff453a 50%, transparent), transparent 70%);
+}
+
+.agent-mini:hover .mini-triangle {
+  filter: drop-shadow(0 0 12px color-mix(in srgb, var(--agent-color) 70%, transparent));
+}
+
+.agent-widget.status-error .agent-mini:hover .mini-triangle {
+  filter: drop-shadow(0 0 12px rgba(255, 69, 58, 0.7));
+}
+
+/* ── Keyframes ── */
+@keyframes glow-breathe {
+  0%, 100% {
+    opacity: 0.3;
+  }
+  50% {
+    opacity: 0.6;
+  }
+}
+
+@keyframes materialize-burst {
+  0% {
+    opacity: 0;
+    transform: scale(0.5);
+  }
+  40% {
+    opacity: 1;
+    transform: scale(1.8);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes triangle-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(-1px) scale(0.6);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(-1px) scale(1);
+  }
+}
+
+/* ── Travel animation (Option B: renderer-only) ── */
+.agent-widget.phase-traveling {
+  animation: travel-in 0.6s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@keyframes travel-in {
+  from {
+    opacity: 0;
+    transform: scale(0.5) translate(var(--travel-x, -50vw), var(--travel-y, 50vh));
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translate(0, 0);
+  }
 }
 
 @keyframes slideFadeIn {
@@ -650,6 +839,7 @@ button, input, select, textarea {
   align-items: center;
   justify-content: center;
   background: transparent;
+  transition: all 0.05s ease-out;
 }
 
 .orb-circle {
