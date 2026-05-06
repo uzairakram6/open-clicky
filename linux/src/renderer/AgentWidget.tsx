@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { stripPointTags } from '../shared/pointTags';
-import type { AgentState, AgentAction, ScreenCapturePayload } from '../shared/types';
+import { formatAgentResponseForDisplay } from '../shared/formatAgentResponse';
+import type { AgentState, ScreenCapturePayload } from '../shared/types';
 import { playAudioBytes } from './playAudio';
 import { useVoiceRecorder } from './useVoiceRecorder';
 
@@ -62,61 +62,38 @@ function inferToolType(command: string, transcript: string): { tone: 'blue' | 'g
   return { tone: 'green', label: 'WORKING' };
 }
 
+function truncateCaption(s: string, max: number): string {
+  const t = s.trim();
+  if (!t.length) return '';
+  if (t.length <= max) return t;
+  const budget = Math.max(8, max - 1);
+  const cut = t.slice(0, budget);
+  const lastSpace = cut.lastIndexOf(' ');
+  const base = lastSpace > max * 0.45 ? cut.slice(0, lastSpace).trimEnd() : cut.trimEnd();
+  return `${base}…`;
+}
+
 export function AgentWidget({ agentId, color }: AgentWidgetProps) {
   const [agent, setAgent] = useState<AgentState | undefined>();
-  const [response, setResponse] = useState('');
   const [error, setError] = useState('');
   const [flashCommand, setFlashCommand] = useState('');
   const [followUpMode, setFollowUpMode] = useState<'none' | 'text' | 'voice'>('none');
   const [followUpText, setFollowUpText] = useState('');
   const [isTerminalVisible, setIsTerminalVisible] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
+  const [isDetailsVisible, setIsDetailsVisible] = useState(false);
   const [arrivalPhase, setArrivalPhase] = useState<ArrivalPhase>('spawning');
   const hasArrivedRef = useRef(false);
   const flashTimeoutRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-  const pendingResponseRef = useRef('');
-  const responseFlushTimeoutRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const realtimeFinalTranscriptRef = useRef('');
   const { transcript, level, isRecording, startRecording, stopRecording } = useVoiceRecorder();
 
   useEffect(() => {
-    const flushPendingResponse = () => {
-      if (responseFlushTimeoutRef.current) {
-        clearTimeout(responseFlushTimeoutRef.current);
-        responseFlushTimeoutRef.current = undefined;
-      }
-      const pending = pendingResponseRef.current;
-      if (!pending) return;
-      pendingResponseRef.current = '';
-      setResponse((current) => stripPointTags(`${current}${pending}`));
-    };
-
-    const queueResponseChunk = (text: string) => {
-      pendingResponseRef.current += text;
-      if (pendingResponseRef.current.length >= 160) {
-        flushPendingResponse();
-        return;
-      }
-      if (!responseFlushTimeoutRef.current) {
-        responseFlushTimeoutRef.current = setTimeout(flushPendingResponse, 50);
-      }
-    };
-
     const disposers = [
       window.clicky.onAgentUpdate((state) => {
         if (state.id === agentId) {
           setAgent(state);
         }
-      }),
-      window.clicky.onChatChunk((text) => {
-        queueResponseChunk(text);
-      }),
-      window.clicky.onChatDone(() => {
-        flushPendingResponse();
-        setResponse((current) => {
-          const clean = stripPointTags(current);
-          return clean;
-        });
       }),
       window.clicky.onChatError((message) => {
         setError(message);
@@ -138,11 +115,6 @@ export function AgentWidget({ agentId, color }: AgentWidgetProps) {
       if (flashTimeoutRef.current) {
         clearTimeout(flashTimeoutRef.current);
       }
-      if (responseFlushTimeoutRef.current) {
-        clearTimeout(responseFlushTimeoutRef.current);
-        responseFlushTimeoutRef.current = undefined;
-      }
-      pendingResponseRef.current = '';
     };
   }, [agentId]);
 
@@ -186,13 +158,16 @@ export function AgentWidget({ agentId, color }: AgentWidgetProps) {
     }
   }, [status, activeCommand]);
 
-  const handleAction = useCallback((action: AgentAction) => {
-    if (action.type === 'copy' && agent?.response) {
-      void navigator.clipboard.writeText(agent.response);
+  let captionDisplay = '';
+  if (isDone && agent) {
+    if (agent.displayCaption.trim()) {
+      captionDisplay = formatAgentResponseForDisplay(agent.displayCaption);
     } else {
-      void window.clicky.runAgentAction(action);
+      const spokenStyled = agent.response ? formatAgentResponseForDisplay(agent.response) : '';
+      captionDisplay = spokenStyled ? truncateCaption(spokenStyled, 160) : '';
     }
-  }, [agent]);
+  }
+  const displayDetails = isDone && agent?.displayDetails?.length ? agent.displayDetails : [];
 
   const closeWidget = useCallback(() => {
     void window.clicky.closeAgent(agentId);
@@ -226,7 +201,6 @@ export function AgentWidget({ agentId, color }: AgentWidgetProps) {
       void 0;
     }
 
-    setResponse('');
     setError('');
     setFollowUpMode('none');
     setFollowUpText('');
@@ -242,7 +216,6 @@ export function AgentWidget({ agentId, color }: AgentWidgetProps) {
 
   const startVoiceFollowUp = useCallback(async () => {
     setFollowUpMode('voice');
-    setResponse('');
     realtimeFinalTranscriptRef.current = '';
 
     await startRecording({
@@ -275,6 +248,13 @@ export function AgentWidget({ agentId, color }: AgentWidgetProps) {
 
   const tool = inferToolType(activeCommand, agent?.transcript ?? '');
 
+  const doneShellTitleRaw =
+    agent?.displayHeader?.trim()
+      ? formatAgentResponseForDisplay(agent.displayHeader)
+      : agent?.displayCaption?.trim()
+        ? formatAgentResponseForDisplay(agent.displayCaption)
+        : '';
+
   const expandWidget = useCallback(() => {
     setIsExpanded(true);
     void window.clicky.setAgentExpanded(agentId, true);
@@ -286,10 +266,18 @@ export function AgentWidget({ agentId, color }: AgentWidgetProps) {
     void window.clicky.setAgentExpanded(agentId, false);
   }, [agentId, followUpMode]);
 
+  useEffect(() => {
+    setIsDetailsVisible(false);
+  }, [agentId, status, agent?.displayCaption]);
+
   const modalTitle =
     status === 'running'
       ? tool.label
-      : (agent?.transcript?.trim() || 'Agent');
+      : isDone
+        ? truncateCaption(doneShellTitleRaw || tool.label, 52).trim() || tool.label
+        : status === 'error'
+          ? 'Error'
+          : (agent?.transcript?.trim() || 'Agent');
   const modalTitleDisplay =
     modalTitle.length > 46 ? `${modalTitle.slice(0, 45).toUpperCase()}…` : modalTitle.toUpperCase();
 
@@ -328,14 +316,30 @@ export function AgentWidget({ agentId, color }: AgentWidgetProps) {
       </header>
 
       <section className="agent-body" aria-hidden={!isExpanded}>
-        {isDone && (agent?.summary || agent?.response) && (
-          <p className="agent-modal-lead">{agent.summary || agent.response}</p>
+        {isDone && captionDisplay && (
+          <p className="agent-modal-lead">{captionDisplay}</p>
         )}
 
-        {isDone && agent?.transcript && (
-          <div className="agent-modal-meta">
-            <span className="modal-section-label">Request</span>
-            <p>{agent.transcript}</p>
+        {displayDetails.length > 0 && (
+          <div className="agent-display-details">
+            <button
+              type="button"
+              className="details-toggle"
+              onClick={() => setIsDetailsVisible((visible) => !visible)}
+              aria-expanded={isDetailsVisible}
+            >
+              {isDetailsVisible ? 'Hide details' : 'View details'}
+            </button>
+            {isDetailsVisible && (
+              <dl className="details-list">
+                {displayDetails.map((detail) => (
+                  <div key={`${detail.label}:${detail.value}`} className="details-row">
+                    <dt>{detail.label}</dt>
+                    <dd>{detail.value}</dd>
+                  </div>
+                ))}
+              </dl>
+            )}
           </div>
         )}
 
@@ -360,18 +364,6 @@ export function AgentWidget({ agentId, color }: AgentWidgetProps) {
           </div>
         )}
 
-        {isDone && agent?.actions && agent.actions.length > 0 && (
-          <div className="agent-suggested">
-            <span className="modal-section-label">Suggested next</span>
-            <div className="agent-actions">
-              {agent.actions.map((action) => (
-                <button key={action.id} type="button" className="action-pill" onClick={() => handleAction(action)}>
-                  {action.label}
-                </button>
-              ))}
-            </div>
-          </div>
-        )}
       </section>
 
       {followUpMode === 'voice' && isRecording && (

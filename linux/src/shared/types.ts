@@ -98,6 +98,11 @@ export interface AgentAction {
   payload?: string;
 }
 
+export interface DisplayDetail {
+  label: string;
+  value: string;
+}
+
 export interface EmailSummary {
   from: string;
   subject: string;
@@ -111,7 +116,13 @@ export interface AgentState {
   id: string;
   status: AgentStatus;
   transcript: string;
+  /** Full assistant reply text for speech + conversation (<<<SPOKEN>>> segment when present). */
   response: string;
+  /** One-line caption for the UI (<<<UI>>> segment). */
+  displayCaption: string;
+  /** Short title-bar line from the assistant (<<<HEADER>>> segment). */
+  displayHeader: string;
+  displayDetails?: DisplayDetail[];
   summary: string;
   commands: string[];
   actions: AgentAction[];

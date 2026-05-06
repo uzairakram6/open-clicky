@@ -11,7 +11,10 @@ import { WorkerApi } from './workerApi';
 import { scrapeWebsite } from './scraper';
 import { ipcChannels } from '../shared/ipcChannels';
 import { buildTaskAcknowledgement, cleanAcknowledgementSpeech } from '../shared/acknowledgement';
-import type { AppSettings, CaptureSource, VoiceTurnRequest, AgentState, WindowContext, AgentAction, ScreenCapturePayload, ShellResult, RecordedAudioPayload, EmailSummary, TranscribeTokenResponse } from '../shared/types';
+import type { AppSettings, CaptureSource, VoiceTurnRequest, AgentState, WindowContext, AgentAction, ScreenCapturePayload, ShellResult, RecordedAudioPayload, TranscribeTokenResponse } from '../shared/types';
+import { splitAgentReply } from '../shared/splitAgentReply';
+import { buildRecentEmailDisplaySummary } from '../shared/emailDisplay';
+import { compactDisplaySummary } from '../shared/displaySummary';
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
@@ -553,45 +556,6 @@ function setAgentWindowExpanded(agentId: string, expanded: boolean): void {
   entry.window.setBounds({ x, y, width, height }, true);
 }
 
-function buildDefaultActions(transcript: string, commands: string[] = [], emails?: EmailSummary[]): AgentAction[] {
-  const actions: AgentAction[] = [{ id: 'copy', label: 'Copy Response', type: 'copy' }];
-  const generatedAppPath = findGeneratedAppPath(commands);
-  if (generatedAppPath) {
-    actions.push({ id: 'open-generated-app', label: 'Open App', type: 'open_folder', payload: generatedAppPath });
-  }
-  if (transcript.toLowerCase().includes('reminder')) {
-    actions.push({ id: 'open-reminders', label: 'Open Reminders', type: 'open_app', payload: 'reminders' });
-  }
-  if (transcript.toLowerCase().includes('desktop') || transcript.toLowerCase().includes('file') || transcript.toLowerCase().includes('folder')) {
-    actions.push({ id: 'open-folder', label: 'Open Folder', type: 'open_folder', payload: app.getPath('desktop') });
-  }
-  if (emails) {
-    for (const email of emails) {
-      for (const filename of email.attachments) {
-        actions.push({
-          id: `download-attachment-${email.uid}-${filename}`,
-          label: `Download ${filename}`,
-          type: 'custom',
-          payload: JSON.stringify({ type: 'download_email_attachment', uid: email.uid, filename })
-        });
-      }
-    }
-  }
-  return actions;
-}
-
-function findGeneratedAppPath(commands: string[]): string | undefined {
-  for (const command of commands.slice().reverse()) {
-    const htmlMatch = command.match(/\/tmp\/clicky_apps\/[^\s'"`]+\.html\b/);
-    if (htmlMatch) return htmlMatch[0];
-  }
-  for (const command of commands.slice().reverse()) {
-    const pathMatch = command.match(/\/tmp\/clicky_apps\/[^\s'"`]+/);
-    if (pathMatch) return pathMatch[0];
-  }
-  return undefined;
-}
-
 function createErrorAgent(message: string): string {
   const agentId = randomUUID();
   console.log('[clicky:agent] creating error agent', { agentId, message });
@@ -602,6 +566,9 @@ function createErrorAgent(message: string): string {
     status: 'error',
     transcript: 'Voice command',
     response: '',
+    displayCaption: '',
+    displayHeader: '',
+    displayDetails: undefined,
     summary: '',
     commands: [],
     actions: [],
@@ -1054,6 +1021,13 @@ async function processAgentStream(
               return text;
             }).join('\n\n');
 
+        const displaySummary = buildRecentEmailDisplaySummary(emails);
+        state.displayHeader = displaySummary.header;
+        state.displayCaption = displaySummary.caption;
+        state.displayDetails = displaySummary.details;
+        state.summary = displaySummary.caption;
+        safeSend(win, ipcChannels.agentUpdate, state);
+
         const toolResultRequest: VoiceTurnRequest = {
           transcript: `Here are the recent emails:\n${emailSummary}`,
           captures: [],
@@ -1252,27 +1226,57 @@ async function processAgentStream(
     } else if (event.type === 'done') {
       chatChunks.flush();
       state.status = 'done';
-      state.response = fullResponse;
-      state.summary = fullResponse.slice(0, 200) + (fullResponse.length > 200 ? '...' : '');
+      const split = splitAgentReply(fullResponse);
+      state.response = split.spokenText;
+      const hasEmailDisplaySummary = Array.isArray(state.emails) && request.transcript.startsWith('Here are the recent emails:');
+      const emailDisplaySummary = hasEmailDisplaySummary ? buildRecentEmailDisplaySummary(state.emails ?? []) : undefined;
+      if (emailDisplaySummary) {
+        state.displayHeader = emailDisplaySummary.header;
+        state.displayCaption = emailDisplaySummary.caption;
+        state.displayDetails = emailDisplaySummary.details;
+      } else {
+        const llmDisplaySummary = compactDisplaySummary({
+          header: split.displayHeader || split.displayCaption || split.spokenText,
+          caption: split.displayCaption || split.displayHeader || split.spokenText
+        });
+        if (split.displayCaption.trim()) {
+          state.displayCaption = llmDisplaySummary.caption;
+        }
+        if (split.displayHeader.trim()) {
+          state.displayHeader = llmDisplaySummary.header;
+        }
+        state.displayDetails = undefined;
+      }
+      {
+        const caption = split.displayCaption.trim();
+        const headerLine = split.displayHeader.trim();
+        const spokenTrim = split.spokenText.trim();
+        const clipped = (t: string) => t.slice(0, 200) + (t.length > 200 ? '...' : '');
+        state.summary = emailDisplaySummary
+          ? emailDisplaySummary.caption
+          : caption ? clipped(caption) : headerLine ? clipped(headerLine) : clipped(spokenTrim);
+      }
       state.completedAt = Date.now();
-      state.actions = buildDefaultActions(request.transcript, state.commands, state.emails);
+      state.actions = [];
       state.conversationHistory = [
         ...request.conversationHistory,
         { role: 'user', content: request.transcript },
-        { role: 'assistant', content: fullResponse }
+        { role: 'assistant', content: split.spokenText }
       ];
       console.log('[clicky:agent] stream done', {
         agentId,
         responseChars: fullResponse.length,
+        spokenChars: split.spokenText.length,
+        headerChars: split.displayHeader.length,
+        captionChars: split.displayCaption.length,
         chunks: chunkCount,
         streamedChars,
-        commands: state.commands.length,
-        actions: state.actions.map((action) => action.label)
+        commands: state.commands.length
       });
       safeSend(win, ipcChannels.chatDone);
       safeSend(win, ipcChannels.agentUpdate, state);
-      if (fullResponse) {
-        speakWithOpenAiInBackground(api, win, agentId, fullResponse, 'response');
+      if (split.spokenText) {
+        speakWithOpenAiInBackground(api, win, agentId, split.spokenText, 'response');
       }
     } else if (event.type === 'error' && event.error) {
       chatChunks.flush();
@@ -1468,6 +1472,9 @@ ipcMain.handle(ipcChannels.agentSpawn, async (_event, request: VoiceTurnRequest)
     status: 'running',
     transcript: request.transcript,
     response: '',
+    displayCaption: '',
+    displayHeader: '',
+    displayDetails: undefined,
     summary: '',
     commands: [],
     actions: [],
@@ -1591,6 +1598,9 @@ ipcMain.handle(ipcChannels.agentFollowUp, async (_event, agentId: string, reques
   state.status = 'running';
   state.transcript = request.transcript;
   state.response = '';
+  state.displayCaption = '';
+  state.displayHeader = '';
+  state.displayDetails = undefined;
   state.summary = '';
   state.commands = [];
   state.error = undefined;
