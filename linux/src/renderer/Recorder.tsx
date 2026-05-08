@@ -9,7 +9,31 @@ export function Recorder() {
   const stopRecordingRef = useRef(stopRecording);
   const isStoppingRef = useRef(false);
   const realtimeFinalTranscriptRef = useRef('');
+  const latestCursorRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  const rafIdRef = useRef<number>(0);
   const [status, setStatus] = useState<'idle' | 'listening' | 'processing'>('idle');
+  const isE2ERef = useRef(window.clicky.e2e.isE2EModeSync);
+
+  // Forward pointer position to the main process so it can track the cursor
+  // on Wayland where screen.getCursorScreenPoint() returns {x:0, y:0}.
+  useEffect(() => {
+    const onPointerMove = (e: PointerEvent) => {
+      latestCursorRef.current = { x: e.screenX, y: e.screenY };
+    };
+    const tick = () => {
+      const pos = latestCursorRef.current;
+      if (pos.x !== 0 || pos.y !== 0) {
+        window.clicky.sendCursorPosition(pos.x, pos.y);
+      }
+      rafIdRef.current = requestAnimationFrame(tick);
+    };
+    document.addEventListener('pointermove', onPointerMove, { passive: true });
+    rafIdRef.current = requestAnimationFrame(tick);
+    return () => {
+      document.removeEventListener('pointermove', onPointerMove);
+      cancelAnimationFrame(rafIdRef.current);
+    };
+  }, []);
 
   useEffect(() => {
     isRecordingRef.current = isRecording;
@@ -19,9 +43,16 @@ export function Recorder() {
 
   useEffect(() => {
     console.log('[clicky:orb] Recorder mounted and waiting for push-to-talk recording start');
+    const isE2E = isE2ERef.current;
+    console.log('[clicky:orb] E2E mode:', isE2E);
+
     const disposeStart = window.clicky.onRecordingStart(() => {
       console.log('[clicky:orb] recording start received', { isRecording: isRecordingRef.current });
-      void startCommandRecording();
+      if (isE2E) {
+        void handleE2EFlow();
+      } else {
+        void startCommandRecording();
+      }
     });
     const disposeStop = window.clicky.onRecordingStop(() => {
       console.log('[clicky:orb] recording stop received', { isRecording: isRecordingRef.current });
@@ -29,11 +60,63 @@ export function Recorder() {
         void stopAndHandoff('hotkey-release');
       }
     });
+    const disposeE2ETranscript = window.clicky.e2e.onInjectTranscript((text) => {
+      console.log('[clicky:orb] E2E transcript injected', { text });
+      handleE2ETranscript(text);
+    });
     return () => {
       disposeStart();
       disposeStop();
+      disposeE2ETranscript();
     };
   }, []);
+
+  const pendingE2ETranscriptRef = useRef<string | undefined>(undefined);
+
+  function handleE2EFlow() {
+    isStoppingRef.current = false;
+    setStatus('listening');
+    if (pendingE2ETranscriptRef.current) {
+      handleE2ETranscript(pendingE2ETranscriptRef.current);
+    }
+  }
+
+  async function handleE2ETranscript(text: string) {
+    const isE2E = isE2ERef.current;
+    if (!isE2E) {
+      pendingE2ETranscriptRef.current = text;
+      return;
+    }
+    pendingE2ETranscriptRef.current = undefined;
+    console.log('[clicky:orb] E2E: using injected transcript, bypassing mic', { chars: text.length });
+
+    const finalTranscript = text.trim();
+    if (!finalTranscript || isStoppingRef.current) return;
+    isStoppingRef.current = true;
+    setStatus('processing');
+
+    const settings = await window.clicky.getSettings();
+    const captures = await captureScreenIfUseful(finalTranscript);
+
+    const request = {
+      transcript: finalTranscript,
+      captures,
+      model: 'gpt-realtime-2',
+      conversationHistory: []
+    };
+
+    console.log('[clicky:orb] E2E: spawning realtime agent from injected transcript');
+    try {
+      await window.clicky.spawnRealtimeAgent(request);
+      console.log('[clicky:orb] E2E: realtime agent spawn IPC completed');
+    } catch (err) {
+      console.error('[clicky:orb] E2E: agent spawn failed:', err);
+      await window.clicky.spawnAgentError('Agent spawn failed');
+    }
+
+    console.log('[clicky:orb] E2E: closing recorder window after handoff');
+    window.close();
+  }
 
   async function stopAndHandoff(reason: string) {
     if (isStoppingRef.current) {
@@ -85,13 +168,13 @@ export function Recorder() {
     const request = {
       transcript: finalTranscript.trim(),
       captures,
-      model: settings.model,
+      model: 'gpt-realtime-2',
       conversationHistory: []
     };
 
     console.log('[clicky:orb] spawning agent from transcript');
     try {
-      await window.clicky.spawnAgent(request);
+      await window.clicky.spawnRealtimeAgent(request);
       console.log('[clicky:orb] agent spawn IPC completed');
     } catch (err) {
       console.error('[clicky:orb] agent spawn failed:', err);

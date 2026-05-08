@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { formatAgentResponseForDisplay } from '../shared/formatAgentResponse';
 import type { AgentState, ScreenCapturePayload } from '../shared/types';
 import { playAudioBytes } from './playAudio';
+import { RealtimeAgentSession } from './realtimeAgent';
 import { useVoiceRecorder } from './useVoiceRecorder';
 
 type ArrivalPhase = 'spawning' | 'materializing' | 'traveling' | 'settled';
@@ -86,13 +87,54 @@ export function AgentWidget({ agentId, color }: AgentWidgetProps) {
   const hasArrivedRef = useRef(false);
   const flashTimeoutRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const realtimeFinalTranscriptRef = useRef('');
+  const realtimeAgentRef = useRef<RealtimeAgentSession | undefined>(undefined);
+  const agentRef = useRef<AgentState | undefined>(undefined);
   const { transcript, level, isRecording, startRecording, stopRecording } = useVoiceRecorder();
 
+  const startRealtimeAgent = useCallback(async (state?: AgentState) => {
+    const current = state ?? agentRef.current;
+    if (!current || current.model !== 'gpt-realtime-2' || realtimeAgentRef.current) return;
+    const session = new RealtimeAgentSession({
+      agentId,
+      initialState: current,
+      onState: (next) => {
+        agentRef.current = next;
+        setAgent(next);
+        window.clicky.reportAgentState(next, 'realtime-state');
+      },
+      onError: setError
+    });
+    realtimeAgentRef.current = session;
+    try {
+      await session.start();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error('[clicky:realtime-agent] start failed', { agentId, message });
+      setError(message);
+      setAgent((prev) => prev ? { ...prev, status: 'error', error: message, completedAt: Date.now() } : prev);
+      session.close();
+      realtimeAgentRef.current = undefined;
+    }
+  }, [agentId]);
+
   useEffect(() => {
+    void window.clicky.getAgentState(agentId).then((state) => {
+      if (!state) return;
+      agentRef.current = state;
+      setAgent(state);
+      if (state.model === 'gpt-realtime-2' && state.status === 'running') {
+        void startRealtimeAgent(state);
+      }
+    });
+
     const disposers = [
       window.clicky.onAgentUpdate((state) => {
         if (state.id === agentId) {
+          agentRef.current = state;
           setAgent(state);
+          if (state.model === 'gpt-realtime-2' && state.status === 'running') {
+            void startRealtimeAgent(state);
+          }
         }
       }),
       window.clicky.onChatError((message) => {
@@ -115,8 +157,27 @@ export function AgentWidget({ agentId, color }: AgentWidgetProps) {
       if (flashTimeoutRef.current) {
         clearTimeout(flashTimeoutRef.current);
       }
+      realtimeAgentRef.current?.close();
     };
-  }, [agentId]);
+  }, [agentId, startRealtimeAgent]);
+
+  useEffect(() => {
+    const stopRealtime = () => {
+      void realtimeAgentRef.current?.stopAndRespond();
+    };
+
+    const disposers = [
+      window.clicky.onRecordingStart(() => void startRealtimeAgent()),
+      window.clicky.onRecordingStop(stopRealtime)
+    ];
+    return () => disposers.forEach((dispose) => dispose());
+  }, [startRealtimeAgent]);
+
+  useEffect(() => {
+    if (agent?.model === 'gpt-realtime-2' && agent.status === 'running') {
+      void startRealtimeAgent(agent);
+    }
+  }, [agent?.model, agent?.status, startRealtimeAgent]);
 
   useEffect(() => {
     if (hasArrivedRef.current) return;

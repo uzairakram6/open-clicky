@@ -86,6 +86,19 @@ export interface RealtimeCallResponse {
   callId?: string;
 }
 
+export type VoiceFlowMode = 'realtime2' | 'legacy';
+
+export interface RealtimeToolRequest {
+  name: string;
+  arguments: string;
+  agentId?: string;
+}
+
+export interface RealtimeToolResponse {
+  output: string;
+  commandLabel?: string;
+}
+
 export interface RecordedAudioPayload {
   bytes: ArrayBuffer;
   mimeType: string;

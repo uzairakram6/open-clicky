@@ -13,6 +13,8 @@ describe('IPC channel contract', () => {
       audioTranscribe: 'audio:transcribe',
       transcribeGetToken: 'transcribe:getToken',
       realtimeCreateCall: 'realtime:createCall',
+      realtimeCreateAgentCall: 'realtime:createAgentCall',
+      realtimeExecuteTool: 'realtime:executeTool',
       ttsSpeak: 'tts:speak',
       recordingStart: 'recording:start',
       recordingStop: 'recording:stop',
@@ -23,6 +25,7 @@ describe('IPC channel contract', () => {
       ttsAudio: 'tts:audio',
       ttsError: 'tts:error',
       agentSpawn: 'agent:spawn',
+      agentSpawnRealtime: 'agent:spawnRealtime',
       agentSpawnError: 'agent:spawnError',
       agentClose: 'agent:close',
       agentGetContext: 'agent:getContext',
@@ -31,10 +34,17 @@ describe('IPC channel contract', () => {
       agentFollowUp: 'agent:followUp',
       agentRunAction: 'agent:runAction',
       agentSetExpanded: 'agent:setExpanded',
+      agentReportState: 'agent:reportState',
+      agentLogEvent: 'agent:logEvent',
       windowGetContext: 'window:getContext',
       executeShell: 'shell:execute',
       openUrl: 'open-url',
-      scrapeWebsite: 'scrape:website'
+      scrapeWebsite: 'scrape:website',
+      cursorPosition: 'cursor:position',
+      e2eIsMode: 'e2e:isE2EMode',
+      e2eStartRecordingFlow: 'e2e:startRecordingFlow',
+      e2eGetAgentStates: 'e2e:getAgentStates',
+      e2eInjectTranscript: 'e2e:injectTranscript'
     });
   });
 });

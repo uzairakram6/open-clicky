@@ -1,5 +1,5 @@
 import { app, BrowserWindow, desktopCapturer, globalShortcut, ipcMain, Menu, nativeImage, screen, session, shell, Tray } from 'electron';
-import { mkdir, readFile, stat, unlink, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, stat, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, extname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -11,10 +11,12 @@ import { WorkerApi } from './workerApi';
 import { scrapeWebsite } from './scraper';
 import { ipcChannels } from '../shared/ipcChannels';
 import { buildTaskAcknowledgement, cleanAcknowledgementSpeech } from '../shared/acknowledgement';
-import type { AppSettings, CaptureSource, VoiceTurnRequest, AgentState, WindowContext, AgentAction, ScreenCapturePayload, ShellResult, RecordedAudioPayload, TranscribeTokenResponse } from '../shared/types';
+import type { AppSettings, CaptureSource, VoiceTurnRequest, AgentState, WindowContext, AgentAction, ScreenCapturePayload, ShellResult, RecordedAudioPayload, TranscribeTokenResponse, RealtimeToolRequest, RealtimeToolResponse } from '../shared/types';
 import { splitAgentReply } from '../shared/splitAgentReply';
 import { buildRecentEmailDisplaySummary } from '../shared/emailDisplay';
 import { compactDisplaySummary } from '../shared/displaySummary';
+import { isE2EMode, createFakeWorkerApi } from '../test-helpers/e2e-mode';
+import { FakeWorkerApi } from '../test-helpers/e2e-fake-api';
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
@@ -62,6 +64,7 @@ const agentWindowMetrics = {
 };
 const CLICKY_APPS_DIR = resolve(tmpdir(), 'clicky_apps');
 const AGENT_COLORS = ['#FFD60A', '#FF453A', '#0A84FF', '#BF5AF2'];
+let fakeWorkerApi: FakeWorkerApi | undefined;
 const assignedAgentColors = new Map<string, string>();
 const CHAT_CHUNK_FLUSH_MS = 50;
 const CHAT_CHUNK_MAX_CHARS = 160;
@@ -71,6 +74,66 @@ function safeSend(win: BrowserWindow | undefined, channel: string, ...args: unkn
   if (win && !win.isDestroyed()) {
     win.webContents.send(channel, ...args);
   }
+}
+
+type AgentRunLogEvent = {
+  at: string;
+  type: string;
+  agentId: string;
+  details?: unknown;
+};
+
+function agentRunDir(): string {
+  return join(app.getPath('userData'), 'agent-runs');
+}
+
+function sanitizeAgentStateForLog(state: AgentState): AgentState {
+  return {
+    ...state,
+    captures: state.captures.map((capture) => ({
+      ...capture,
+      jpegBase64: `[redacted:${capture.jpegBase64.length} chars]`
+    }))
+  };
+}
+
+function trimLogText(value: string, max = 12000): string {
+  return value.length > max ? `${value.slice(0, max)}...[truncated ${value.length - max} chars]` : value;
+}
+
+function logAgentRunEvent(agentId: string, type: string, details?: unknown): void {
+  void (async () => {
+    try {
+      const dir = agentRunDir();
+      await mkdir(dir, { recursive: true });
+      const event: AgentRunLogEvent = { at: new Date().toISOString(), type, agentId, details };
+      await appendFile(join(dir, `${agentId}.jsonl`), `${JSON.stringify(event)}\n`, 'utf8');
+    } catch (error) {
+      console.warn('[clicky:agent-log] write failed', {
+        agentId,
+        type,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  })();
+}
+
+function persistAgentStateSnapshot(state: AgentState, reason: string): void {
+  const sanitized = sanitizeAgentStateForLog(state);
+  logAgentRunEvent(state.id, 'state_snapshot', { reason, state: sanitized });
+  void (async () => {
+    try {
+      const dir = agentRunDir();
+      await mkdir(dir, { recursive: true });
+      await writeFile(join(dir, `${state.id}.latest.json`), JSON.stringify({ reason, state: sanitized }, null, 2), 'utf8');
+    } catch (error) {
+      console.warn('[clicky:agent-log] snapshot write failed', {
+        agentId: state.id,
+        reason,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  })();
 }
 
 function createChatChunkFlusher(win: BrowserWindow): { append: (text: string) => void; flush: () => void; dispose: () => void } {
@@ -171,22 +234,26 @@ function speakWithOpenAiInBackground(api: WorkerApi, win: BrowserWindow, agentId
   void (async () => {
     const speechText = normalizeSpeechText(stripPointTagsForSpeech(text));
     if (!speechText) return;
+    logAgentRunEvent(agentId, 'tts_request', { reason, text: trimLogText(speechText), chars: speechText.length });
 
     try {
       console.log('[clicky:agent] requesting OpenAI speech', { agentId, reason, chars: speechText.length });
       const audio = await api.synthesizeSpeech(speechText);
       if (reason === 'acknowledgement' && agents.get(agentId)?.state.status !== 'running') {
         console.log('[clicky:agent] skipped stale acknowledgement speech', { agentId });
+        logAgentRunEvent(agentId, 'tts_skipped_stale_acknowledgement');
         return;
       }
       safeSend(win, ipcChannels.ttsAudio, audio);
       console.log('[clicky:agent] OpenAI speech audio sent', { agentId, reason, bytes: audio.byteLength });
+      logAgentRunEvent(agentId, 'tts_audio_sent', { reason, bytes: audio.byteLength });
     } catch (error) {
       console.warn('[clicky:agent] OpenAI speech failed; falling back to local speech', {
         agentId,
         reason,
         error: error instanceof Error ? error.message : String(error)
       });
+      logAgentRunEvent(agentId, 'tts_error', { reason, error: error instanceof Error ? error.message : String(error) });
       try {
         await speakTextLocally(win, speechText);
       } catch {
@@ -241,6 +308,8 @@ function stopCursorTracking(reason: string): void {
   console.log('[clicky:orb] cursor tracking interval cleared', { reason });
 }
 
+let lastRendererCursorPos: { x: number; y: number } | undefined;
+
 function getOrbCursorBounds(width: number, height: number): { x: number; y: number; cursor: Electron.Point; displayId: number } {
   const cursor = screen.getCursorScreenPoint();
   const display = screen.getDisplayNearestPoint(cursor);
@@ -262,7 +331,7 @@ function pickAgentColor(): string {
   return AGENT_COLORS[Math.floor(Math.random() * AGENT_COLORS.length)];
 }
 
-const hasSingleInstanceLock = app.requestSingleInstanceLock();
+const hasSingleInstanceLock = isE2EMode() ? true : app.requestSingleInstanceLock();
 if (!hasSingleInstanceLock) {
   console.log('[clicky:main] another Clicky instance is already running; exiting this launcher process');
   app.quit();
@@ -306,8 +375,10 @@ async function initApp(): Promise<void> {
   }, { useSystemPicker: false });
 
   createKeepAliveWindow();
-  createTray();
-  registerPushToTalkShortcut();
+  if (!isE2EMode()) {
+    createTray();
+    registerPushToTalkShortcut();
+  }
 
   if (process.argv.includes(TOGGLE_RECORDER_ARG)) {
     console.log('[clicky:hotkey] toggle argument detected on startup');
@@ -321,12 +392,13 @@ function createKeepAliveWindow(): void {
   if (keepAliveWindow && !keepAliveWindow.isDestroyed()) return;
 
   keepAliveWindow = new BrowserWindow({
-    width: 1,
-    height: 1,
-    show: false,
+    width: isE2EMode() ? 400 : 1,
+    height: isE2EMode() ? 300 : 1,
+    show: isE2EMode(),
     skipTaskbar: true,
-    focusable: false,
+    focusable: !isE2EMode(),
     webPreferences: {
+      preload: isE2EMode() ? join(__dirname, '../preload/preload.cjs') : undefined,
       nodeIntegration: false,
       contextIsolation: true,
       sandbox: true
@@ -336,6 +408,11 @@ function createKeepAliveWindow(): void {
   keepAliveWindow.on('closed', () => {
     keepAliveWindow = undefined;
   });
+
+  if (isE2EMode()) {
+    const rendererHtml = join(__dirname, '../renderer/index.html');
+    void keepAliveWindow.loadFile(rendererHtml);
+  }
   keepAliveTimer ??= setInterval(() => {
     void 0;
   }, 60_000);
@@ -483,6 +560,46 @@ function createOrbWindow(): void {
   });
 }
 
+function createRealtimeAgent(request: VoiceTurnRequest): string {
+  const agentId = randomUUID();
+  const win = createAgentWindow(agentId);
+  const color = assignedAgentColors.get(agentId);
+  const state: AgentState = {
+    id: agentId,
+    status: 'running',
+    transcript: request.transcript,
+    response: '',
+    displayCaption: '',
+    displayHeader: 'Thinking',
+    displayDetails: undefined,
+    summary: 'Processing...',
+    commands: [],
+    actions: [],
+    model: 'gpt-realtime-2',
+    conversationHistory: request.conversationHistory,
+    captures: request.captures,
+    createdAt: Date.now(),
+    color
+  };
+
+  agents.set(agentId, { window: win, state, expanded: false });
+  logAgentRunEvent(agentId, 'agent_spawn_realtime', {
+    transcript: request.transcript,
+    captures: request.captures.map(({ label, width, height }) => ({ label, width, height })),
+    model: state.model
+  });
+  persistAgentStateSnapshot(state, 'spawn-realtime');
+  const sendInitialState = (reason: string) => {
+    console.log('[clicky:agent] sending realtime initial state', { agentId, reason });
+    safeSend(win, ipcChannels.agentUpdate, state);
+  };
+  win.webContents.on('did-finish-load', () => sendInitialState('did-finish-load'));
+  win.once('ready-to-show', () => sendInitialState('ready-to-show'));
+  setTimeout(() => sendInitialState('delayed-250ms'), 250);
+  setTimeout(() => sendInitialState('delayed-1000ms'), 1000);
+  return agentId;
+}
+
 function createAgentWindow(agentId: string): BrowserWindow {
   const color = pickAgentColor();
   assignedAgentColors.set(agentId, color);
@@ -582,6 +699,8 @@ function createErrorAgent(message: string): string {
   };
 
   agents.set(agentId, { window: win, state, expanded: false });
+  logAgentRunEvent(agentId, 'agent_spawn_error', { message });
+  persistAgentStateSnapshot(state, 'spawn-error');
   win.webContents.on('did-finish-load', () => {
     console.log('[clicky:agent] sending error state to renderer', { agentId });
     safeSend(win, ipcChannels.agentUpdate, state);
@@ -729,6 +848,178 @@ function extensionForMimeType(mimeType: string): string {
   if (mimeType.includes('mpeg') || mimeType.includes('mp3')) return '.mp3';
   if (mimeType.includes('mp4') || mimeType.includes('m4a')) return '.m4a';
   return '.webm';
+}
+
+async function executeRealtimeToolRequest(request: RealtimeToolRequest): Promise<RealtimeToolResponse> {
+  const args = request.arguments ? JSON.parse(request.arguments) as Record<string, unknown> : {};
+  const agentEntry = request.agentId ? agents.get(request.agentId) : undefined;
+  const agentId = request.agentId ?? 'unknown-agent';
+  logAgentRunEvent(agentId, 'realtime_tool_call', {
+    name: request.name,
+    arguments: trimLogText(request.arguments || '{}')
+  });
+  const flash = (label: string) => {
+    if (agentEntry) {
+      agentEntry.state.commands.push(label);
+      logAgentRunEvent(agentEntry.state.id, 'command_flash', { label });
+      persistAgentStateSnapshot(agentEntry.state, 'realtime-command-flash');
+      safeSend(agentEntry.window, ipcChannels.agentCommandFlash, label);
+      safeSend(agentEntry.window, ipcChannels.agentUpdate, agentEntry.state);
+    }
+  };
+
+  if (request.name === 'check_email') {
+    const count = Math.min(Math.max(typeof args.count === 'number' ? args.count : 5, 1), 10);
+    flash('Checking emails...');
+    try {
+      const { fetchRecentEmails } = await import('./emailService');
+      const emailConfig = settings.email ?? { enabled: false, provider: 'gmail', username: '', password: '' };
+      const emails = await withTimeout(fetchRecentEmails(emailConfig, count), 12_000, 'Email check timed out');
+      if (agentEntry) {
+        agentEntry.state.emails = emails;
+        persistAgentStateSnapshot(agentEntry.state, 'realtime-email-fetched');
+      }
+      logAgentRunEvent(agentId, 'realtime_tool_result', {
+        name: request.name,
+        ok: true,
+        emailCount: emails.length,
+        outputChars: emails.length === 0 ? 'No emails found in your inbox.'.length : undefined
+      });
+      return {
+        commandLabel: 'Checking emails...',
+        output: emails.length === 0
+          ? 'No emails found in your inbox.'
+          : emails.map((email, index) => {
+              const attachments = email.attachments.length ? `\nAttachments: ${email.attachments.join(', ')}` : '';
+              return `Email #${index + 1}\nFrom: ${email.from}\nSubject: ${email.subject}\nDate: ${email.date}\nPreview: ${email.preview}${attachments}`;
+            }).join('\n\n')
+      };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logAgentRunEvent(agentId, 'realtime_tool_result', {
+        name: request.name,
+        ok: false,
+        error: message
+      });
+      return {
+        commandLabel: 'Email check failed',
+        output: `Email check failed. I tried to access your configured inbox, but the email tool returned this error: ${message}`
+      };
+    }
+  }
+
+  if (request.name === 'execute_bash_command') {
+    const command = typeof args.command === 'string' ? args.command : '';
+    if (!command) {
+      logAgentRunEvent(agentId, 'realtime_tool_result', {
+        name: request.name,
+        ok: false,
+        error: 'Missing command'
+      });
+      return { output: 'Shell command failed: missing command.' };
+    }
+
+    flash(command);
+    const result = await executeShellCommand(command);
+    logAgentRunEvent(agentId, 'realtime_tool_result', {
+      name: request.name,
+      ok: !result.error,
+      command,
+      stdout: trimLogText(result.stdout),
+      stderr: trimLogText(result.stderr),
+      error: result.error
+    });
+    return {
+      commandLabel: command,
+      output: `Command executed.\nSTDOUT:\n${result.stdout}\nSTDERR:\n${result.stderr}${result.error ? `\nERROR:\n${result.error}` : ''}`.trim()
+    };
+  }
+
+  if (request.name === 'write_file') {
+    const filePath = typeof args.file_path === 'string' ? args.file_path : '';
+    const content = typeof args.content === 'string' ? args.content : undefined;
+    if (!filePath || content === undefined) {
+      logAgentRunEvent(agentId, 'realtime_tool_result', {
+        name: request.name,
+        ok: false,
+        error: 'Missing file_path or content'
+      });
+      return { output: 'File write failed: missing file_path or content.' };
+    }
+
+    flash(`Writing ${filePath}`);
+    try {
+      const writtenPath = await writeGeneratedFile(filePath, content);
+      logAgentRunEvent(agentId, 'realtime_tool_result', {
+        name: request.name,
+        ok: true,
+        path: writtenPath,
+        chars: content.length
+      });
+      return { commandLabel: `Writing ${filePath}`, output: `File written successfully: ${writtenPath}` };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logAgentRunEvent(agentId, 'realtime_tool_result', {
+        name: request.name,
+        ok: false,
+        path: filePath,
+        error: message
+      });
+      return { commandLabel: `Writing ${filePath}`, output: `File write failed: ${message}` };
+    }
+  }
+
+  if (request.name === 'open_url') {
+    const url = typeof args.url === 'string' ? args.url : '';
+    if (!url) {
+      return { output: 'Open URL failed: missing url.' };
+    }
+    flash(`Opening ${url} in browser...`);
+    try {
+      await shell.openExternal(url);
+      logAgentRunEvent(agentId, 'realtime_tool_result', { name: request.name, ok: true, url });
+      return { commandLabel: `Opening ${url} in browser...`, output: 'The link has been opened in the default browser.' };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logAgentRunEvent(agentId, 'realtime_tool_result', { name: request.name, ok: false, url, error: message });
+      return { commandLabel: `Opening ${url} in browser...`, output: `Open URL failed: ${message}` };
+    }
+  }
+
+  if (request.name === 'scrape_website') {
+    const url = typeof args.url === 'string' ? args.url : '';
+    if (!url) {
+      return { output: 'Website scrape failed: missing url.' };
+    }
+    flash(`Scraping ${url}...`);
+    try {
+      const result = await scrapeWebsite({
+        url,
+        extractMode: args.extractMode === 'text' ? 'text' : 'markdown',
+        maxChars: typeof args.maxChars === 'number' ? args.maxChars : undefined
+      });
+      const prefix = result.title ? `# ${result.title}\n\n` : '';
+      logAgentRunEvent(agentId, 'realtime_tool_result', {
+        name: request.name,
+        ok: true,
+        url,
+        extractor: result.extractor,
+        textChars: result.text.length
+      });
+      return { commandLabel: `Scraping ${url}...`, output: `${prefix}${result.text}` };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logAgentRunEvent(agentId, 'realtime_tool_result', { name: request.name, ok: false, url, error: message });
+      return { commandLabel: `Scraping ${url}...`, output: `Website scrape failed: ${message}` };
+    }
+  }
+
+  logAgentRunEvent(agentId, 'realtime_tool_result', {
+    name: request.name,
+    ok: false,
+    error: 'Unknown tool'
+  });
+  return { output: `Unknown tool: ${request.name}` };
 }
 
 function splitEnvList(value: string | undefined): string[] {
@@ -891,6 +1182,12 @@ async function processAgentStream(
     captures: request.captures.length,
     history: request.conversationHistory.length
   });
+  logAgentRunEvent(agentId, 'stream_started', {
+    transcript: trimLogText(request.transcript),
+    captures: request.captures.map(({ label, width, height }) => ({ label, width, height })),
+    model: request.model,
+    history: request.conversationHistory.length
+  });
   let fullResponse = '';
   let chunkCount = 0;
   let streamedChars = 0;
@@ -905,6 +1202,7 @@ async function processAgentStream(
         const commandMatch = event.text.match(/(?:^|\n)(?:\$\s+)?(ls\s+|sed\s+|mkdir\s+|cd\s+|cp\s+|mv\s+|rm\s+|git\s+|npm\s+|pip\s+|python\s+|node\s+)[^\n]+/);
         if (commandMatch) {
           state.commands.push(commandMatch[0].trim());
+          logAgentRunEvent(agentId, 'command_detected_in_stream', { command: commandMatch[0].trim() });
           console.log('[clicky:agent] command detected in stream', {
             agentId,
             command: commandMatch[0].trim()
@@ -923,10 +1221,21 @@ async function processAgentStream(
         const command = args.command;
         if (command) {
           state.commands.push(command);
+          logAgentRunEvent(agentId, 'tool_call', {
+            name: 'execute_bash_command',
+            arguments: { command }
+          });
           console.log('[clicky:agent] executing tool command', { agentId, command });
           safeSend(win, ipcChannels.agentCommandFlash, command);
 
           const result = await executeShellCommand(command);
+          logAgentRunEvent(agentId, 'tool_result', {
+            name: 'execute_bash_command',
+            ok: !result.error,
+            stdout: trimLogText(result.stdout),
+            stderr: trimLogText(result.stderr),
+            error: result.error
+          });
           console.log('[clicky:agent] tool command completed', {
             agentId,
             stdoutChars: result.stdout.length,
@@ -964,15 +1273,31 @@ async function processAgentStream(
       if (filePath && typeof content === 'string') {
         const feedback = `Writing ${filePath}`;
         state.commands.push(feedback);
+        logAgentRunEvent(agentId, 'tool_call', {
+          name: 'write_file',
+          arguments: { file_path: filePath, contentChars: content.length }
+        });
         safeSend(win, ipcChannels.agentCommandFlash, feedback);
 
         let transcript: string;
         try {
           const writtenPath = await writeGeneratedFile(filePath, content);
+          logAgentRunEvent(agentId, 'tool_result', {
+            name: 'write_file',
+            ok: true,
+            path: writtenPath,
+            chars: content.length
+          });
           console.log('[clicky:agent] file written', { agentId, path: writtenPath, chars: content.length });
           transcript = `File written successfully: ${writtenPath}\nNext, launch it if this is an app, website, game, tool, or script.`;
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
+          logAgentRunEvent(agentId, 'tool_result', {
+            name: 'write_file',
+            ok: false,
+            path: filePath,
+            error: message
+          });
           console.error('[clicky:agent] write_file failed', { agentId, filePath, error: message });
           transcript = `I was unable to write the file. Error: ${message}`;
         }
@@ -1003,14 +1328,26 @@ async function processAgentStream(
       }
       const count = Math.min(Math.max(args.count ?? 5, 1), 10);
       console.log('[clicky:agent] checking emails', { agentId, count, emailSettings: summarizeEmailConfig(settings.email) });
+      logAgentRunEvent(agentId, 'tool_call', {
+        name: 'check_email',
+        arguments: { count },
+        emailSettings: summarizeEmailConfig(settings.email)
+      });
+      state.commands.push('Checking emails...');
+      persistAgentStateSnapshot(state, 'check-email-started');
       safeSend(win, ipcChannels.agentCommandFlash, 'Checking emails...');
 
       try {
         const { fetchRecentEmails } = await import('./emailService');
         const emailConfig = settings.email ?? { enabled: false, provider: 'gmail', username: '', password: '' };
         console.log('[clicky:agent] email config resolved', { enabled: emailConfig.enabled, username: emailConfig.username, hasPassword: !!emailConfig.password });
-        const emails = await fetchRecentEmails(emailConfig, count);
+        const emails = await withTimeout(fetchRecentEmails(emailConfig, count), 12_000, 'Email check timed out');
         state.emails = emails;
+        logAgentRunEvent(agentId, 'tool_result', {
+          name: 'check_email',
+          ok: true,
+          emailCount: emails.length
+        });
         const emailSummary = emails.length === 0
           ? 'No emails found in your inbox.'
           : emails.map((e, i) => {
@@ -1045,8 +1382,20 @@ async function processAgentStream(
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         console.error('[clicky:agent] email check failed', { agentId, error: message });
+        logAgentRunEvent(agentId, 'tool_result', {
+          name: 'check_email',
+          ok: false,
+          error: message
+        });
+        state.displayHeader = 'Email check failed';
+        state.displayCaption = `I tried to check your inbox, but the email tool failed: ${message}`;
+        state.summary = state.displayCaption;
+        state.commands.push('Email check failed');
+        persistAgentStateSnapshot(state, 'check-email-failed');
+        safeSend(win, ipcChannels.agentCommandFlash, 'Email check failed');
+        safeSend(win, ipcChannels.agentUpdate, state);
         const toolResultRequest: VoiceTurnRequest = {
-          transcript: `I was unable to check your emails. Error: ${message}`,
+          transcript: `Email check failed. I tried to access the user's configured inbox, but the email tool returned this error: ${message}. Tell the user that the email check failed because of this tool error, and do not imply that you skipped checking email.`,
           captures: [],
           model: request.model,
           conversationHistory: [
@@ -1070,9 +1419,11 @@ async function processAgentStream(
       }
       const url = args.url;
       if (url) {
+        logAgentRunEvent(agentId, 'tool_call', { name: 'open_url', arguments: { url } });
         safeSend(win, ipcChannels.agentCommandFlash, `Opening ${url} in browser...`);
         try {
           await shell.openExternal(url);
+          logAgentRunEvent(agentId, 'tool_result', { name: 'open_url', ok: true, url });
           console.log('[clicky:agent] URL opened successfully', { agentId, url });
           const toolResultRequest: VoiceTurnRequest = {
             transcript: `The link has been opened in the user's default browser.`,
@@ -1089,6 +1440,7 @@ async function processAgentStream(
           return;
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
+          logAgentRunEvent(agentId, 'tool_result', { name: 'open_url', ok: false, url, error: message });
           console.error('[clicky:agent] open_url failed', { agentId, url, error: message });
           const toolResultRequest: VoiceTurnRequest = {
             transcript: `I was unable to open the link. Error: ${message}`,
@@ -1116,12 +1468,23 @@ async function processAgentStream(
       }
       const url = args.url;
       if (url) {
+        logAgentRunEvent(agentId, 'tool_call', {
+          name: 'scrape_website',
+          arguments: { url, extractMode: args.extractMode, maxChars: args.maxChars }
+        });
         safeSend(win, ipcChannels.agentCommandFlash, `Scraping ${url}...`);
         try {
           const result = await scrapeWebsite({
             url,
             extractMode: args.extractMode === 'text' ? 'text' : 'markdown',
             maxChars: args.maxChars,
+          });
+          logAgentRunEvent(agentId, 'tool_result', {
+            name: 'scrape_website',
+            ok: true,
+            url,
+            extractor: result.extractor,
+            textChars: result.text.length
           });
           console.log('[clicky:agent] website scraped successfully', { agentId, url, extractor: result.extractor });
           const prefix = result.title ? `# ${result.title}\n\n` : '';
@@ -1140,6 +1503,7 @@ async function processAgentStream(
           return;
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
+          logAgentRunEvent(agentId, 'tool_result', { name: 'scrape_website', ok: false, url, error: message });
           console.error('[clicky:agent] scrape_website failed', { agentId, url, error: message });
           const toolResultRequest: VoiceTurnRequest = {
             transcript: `I was unable to scrape the website. Error: ${message}`,
@@ -1167,6 +1531,10 @@ async function processAgentStream(
       }
       const emailNumber = args.email_number;
       const filename = args.filename;
+      logAgentRunEvent(agentId, 'tool_call', {
+        name: 'download_email_attachment',
+        arguments: { email_number: emailNumber, filename }
+      });
       const emails = state.emails ?? [];
       const email = emailNumber && emailNumber > 0 && emailNumber <= emails.length ? emails[emailNumber - 1] : undefined;
 
@@ -1192,6 +1560,13 @@ async function processAgentStream(
         const { downloadAttachment } = await import('./emailService');
         const destPath = await ensureUniquePath(app.getPath('downloads'), filename);
         await downloadAttachment(emailConfig, email.uid, filename, destPath);
+        logAgentRunEvent(agentId, 'tool_result', {
+          name: 'download_email_attachment',
+          ok: true,
+          uid: email.uid,
+          filename,
+          destPath
+        });
         console.log('[clicky:agent] attachment downloaded', { agentId, uid: email.uid, filename, destPath });
         const toolResultRequest: VoiceTurnRequest = {
           transcript: `The attachment "${filename}" has been downloaded to ${destPath}.`,
@@ -1208,6 +1583,13 @@ async function processAgentStream(
         return;
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
+        logAgentRunEvent(agentId, 'tool_result', {
+          name: 'download_email_attachment',
+          ok: false,
+          uid: email.uid,
+          filename,
+          error: message
+        });
         console.error('[clicky:agent] download_email_attachment failed', { agentId, uid: email.uid, filename, error: message });
         const toolResultRequest: VoiceTurnRequest = {
           transcript: `I was unable to download the attachment "${filename}". Error: ${message}`,
@@ -1273,6 +1655,16 @@ async function processAgentStream(
         streamedChars,
         commands: state.commands.length
       });
+      logAgentRunEvent(agentId, 'stream_done', {
+        response: trimLogText(fullResponse),
+        spokenText: trimLogText(split.spokenText),
+        displayHeader: split.displayHeader,
+        displayCaption: split.displayCaption,
+        chunks: chunkCount,
+        streamedChars,
+        commands: state.commands
+      });
+      persistAgentStateSnapshot(state, 'stream-done');
       safeSend(win, ipcChannels.chatDone);
       safeSend(win, ipcChannels.agentUpdate, state);
       if (split.spokenText) {
@@ -1283,6 +1675,8 @@ async function processAgentStream(
       state.status = 'error';
       state.error = event.error;
       console.error('[clicky:agent] stream error', { agentId, error: event.error });
+      logAgentRunEvent(agentId, 'stream_error', { error: event.error });
+      persistAgentStateSnapshot(state, 'stream-error');
       safeSend(win, ipcChannels.chatError, event.error);
       safeSend(win, ipcChannels.agentUpdate, state);
     }
@@ -1323,6 +1717,17 @@ ipcMain.handle(ipcChannels.captureSetSelectedScreen, async (_event, source: Capt
 
 function isWayland(): boolean {
   return process.env.XDG_SESSION_TYPE === 'wayland' || !!process.env.WAYLAND_DISPLAY;
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  console.log('[clicky:timeout] wrapping call with', ms, 'ms timeout');
+  const timer = setTimeout(() => {
+    console.log('[clicky:timeout] TIMEOUT FIRED:', message);
+  }, ms);
+  return Promise.race([
+    promise.then((val) => { clearTimeout(timer); return val; }),
+    new Promise<T>((_, reject) => setTimeout(() => { console.log('[clicky:timeout] rejecting with', message); reject(new Error(message)); }, ms))
+  ]);
 }
 
 async function tryGrimScreenshot(): Promise<ScreenCapturePayload | null> {
@@ -1445,13 +1850,31 @@ ipcMain.handle(ipcChannels.realtimeCreateCall, async (_event, offerSdp: string) 
   return api.createRealtimeTranscriptionCall(offerSdp);
 });
 
+ipcMain.handle(ipcChannels.realtimeCreateAgentCall, async (_event, offerSdp: string) => {
+  const api = new WorkerApi({ workerBaseUrl: settings.workerBaseUrl });
+  return api.createRealtimeAgentCall(offerSdp);
+});
+
+ipcMain.handle(ipcChannels.realtimeExecuteTool, async (_event, request: RealtimeToolRequest): Promise<RealtimeToolResponse> => {
+  return executeRealtimeToolRequest(request);
+});
+
 ipcMain.handle(ipcChannels.ttsSpeak, async (_event, text: string, agentId?: string) => {
   const api = new WorkerApi({ workerBaseUrl: settings.workerBaseUrl });
   const targetWindow = agentId ? agents.get(agentId)?.window : undefined;
+  if (agentId) {
+    logAgentRunEvent(agentId, 'tts_request', { reason: 'direct', text: trimLogText(text), chars: text.length });
+  }
   try {
     const audio = await api.synthesizeSpeech(text);
     safeSend(targetWindow, ipcChannels.ttsAudio, audio);
+    if (agentId) {
+      logAgentRunEvent(agentId, 'tts_audio_sent', { reason: 'direct', bytes: audio.byteLength });
+    }
   } catch (error) {
+    if (agentId) {
+      logAgentRunEvent(agentId, 'tts_error', { reason: 'direct', error: error instanceof Error ? error.message : String(error) });
+    }
     safeSend(targetWindow, ipcChannels.ttsError, error instanceof Error ? error.message : String(error));
   }
 });
@@ -1487,6 +1910,12 @@ ipcMain.handle(ipcChannels.agentSpawn, async (_event, request: VoiceTurnRequest)
 
   agents.set(agentId, { window: win, state, expanded: false });
   console.log('[clicky:agent] state stored', { agentId });
+  logAgentRunEvent(agentId, 'agent_spawn', {
+    transcript: request.transcript,
+    captures: request.captures.map(({ label, width, height }) => ({ label, width, height })),
+    model: request.model
+  });
+  persistAgentStateSnapshot(state, 'spawn');
 
   win.webContents.on('did-finish-load', () => {
     console.log('[clicky:agent] renderer loaded; sending initial state', { agentId });
@@ -1503,11 +1932,21 @@ ipcMain.handle(ipcChannels.agentSpawn, async (_event, request: VoiceTurnRequest)
     console.error('[clicky:agent] processAgentStream threw', { agentId, error: message });
     state.status = 'error';
     state.error = message;
+    logAgentRunEvent(agentId, 'stream_exception', { error: message });
+    persistAgentStateSnapshot(state, 'stream-exception');
     safeSend(win, ipcChannels.chatError, message);
     safeSend(win, ipcChannels.agentUpdate, state);
   }
 
   return agentId;
+});
+
+ipcMain.handle(ipcChannels.agentSpawnRealtime, (_event, request: VoiceTurnRequest): string => {
+  console.log('[clicky:agent] realtime spawn requested', {
+    transcript: request.transcript,
+    captures: request.captures.length
+  });
+  return createRealtimeAgent(request);
 });
 
 ipcMain.handle(ipcChannels.agentSpawnError, (_event, message: string): string => {
@@ -1522,52 +1961,48 @@ ipcMain.handle(ipcChannels.agentClose, (_event, agentId: string) => {
   }
 });
 
-ipcMain.handle(ipcChannels.agentRunAction, async (_event, action: AgentAction) => {
-  if (action.type === 'open_folder' && action.payload) {
-    const result = await shell.openPath(action.payload);
-    if (result) {
-      throw new Error(result);
-    }
-  } else if (action.type === 'open_app' && action.payload) {
-    await shell.openExternal(`x-scheme-handler/${action.payload}`).catch(async () => {
-      await execAsync(`xdg-open ${JSON.stringify(action.payload)}`);
-    });
-  } else if (action.type === 'open_url' && action.payload) {
-    await shell.openExternal(action.payload);
-  } else if (action.type === 'custom' && action.payload) {
-    const payload = JSON.parse(action.payload) as { type: string; uid: number; filename: string };
-    if (payload.type === 'download_email_attachment') {
-      const emailConfig = settings.email ?? { enabled: false, provider: 'gmail', username: '', password: '' };
-      if (!emailConfig.enabled) {
-        throw new Error('Email not configured.');
-      }
-      const { downloadAttachment } = await import('./emailService');
-      const destPath = await ensureUniquePath(app.getPath('downloads'), payload.filename);
-      await downloadAttachment(emailConfig, payload.uid, payload.filename, destPath);
-      await shell.openPath(dirname(destPath));
-    }
-  }
+ipcMain.handle(ipcChannels.agentGetContext, (_event, agentId: string): AgentState | undefined => {
+  const state = agents.get(agentId)?.state;
+  console.log('[clicky:agent] get state requested', { agentId, found: !!state });
+  return state;
 });
 
 ipcMain.handle(ipcChannels.agentSetExpanded, (_event, agentId: string, expanded: boolean) => {
   setAgentWindowExpanded(agentId, expanded);
+  logAgentRunEvent(agentId, 'window_expanded_changed', { expanded });
 });
 
-ipcMain.handle(ipcChannels.openUrl, async (_event, url: string) => {
-  console.log('[clicky:main] openUrl invoked', { url });
-  await shell.openExternal(url);
+ipcMain.on(ipcChannels.agentReportState, (event, state: AgentState, reason: string) => {
+  const entry = agents.get(state.id);
+  if (!entry || event.sender.id !== entry.window.webContents.id) return;
+  entry.state = state;
+  if (reason === 'realtime-state' && state.status === 'running') return;
+  persistAgentStateSnapshot(state, reason || 'renderer-report');
 });
 
-ipcMain.handle(ipcChannels.scrapeWebsite, async (_event, url: string): Promise<string> => {
-  console.log('[clicky:main] scrapeWebsite invoked', { url });
-  const result = await scrapeWebsite({ url });
-  const prefix = result.title ? `# ${result.title}\n\n` : '';
-  return `${prefix}${result.text}`;
+ipcMain.on(ipcChannels.agentLogEvent, (event, agentId: string, type: string, details?: unknown) => {
+  const entry = agents.get(agentId);
+  if (!entry || event.sender.id !== entry.window.webContents.id) return;
+  logAgentRunEvent(agentId, type, details);
 });
 
 ipcMain.handle(ipcChannels.windowGetContext, (event): WindowContext | undefined => {
   return windowContexts.get(event.sender.id);
 });
+
+if (isE2EMode()) {
+  fakeWorkerApi = createFakeWorkerApi();
+  const { registerE2EIpcHandlers } = await import('../test-helpers/e2e-mode');
+  registerE2EIpcHandlers(
+    ipcMain as unknown as { handle(channel: string, listener: (event: unknown, ...args: any[]) => any): void },
+    safeSend as (win: unknown, channel: string, ...args: unknown[]) => void,
+    openRecorderOrb,
+    () => recorderWindow as unknown as { isDestroyed(): boolean; close(): void } | undefined,
+    () => recorderWindowReady,
+    agents as unknown as Map<string, any>,
+  );
+  console.log('[clicky:e2e] E2E IPC handlers registered');
+}
 
 ipcMain.handle(ipcChannels.executeShell, async (_event, command: string): Promise<ShellResult> => {
   try {
@@ -1579,6 +2014,11 @@ ipcMain.handle(ipcChannels.executeShell, async (_event, command: string): Promis
     const stderr = (err as { stderr?: string }).stderr ?? '';
     return { stdout: stdout.trim(), stderr: stderr.trim(), error: message };
   }
+});
+
+ipcMain.on(ipcChannels.cursorPosition, (event, x: number, y: number) => {
+  if (event.sender.id !== recorderWindow?.webContents.id) return;
+  lastRendererCursorPos = { x, y };
 });
 
 ipcMain.handle(ipcChannels.agentFollowUp, async (_event, agentId: string, request: VoiceTurnRequest) => {
@@ -1606,6 +2046,13 @@ ipcMain.handle(ipcChannels.agentFollowUp, async (_event, agentId: string, reques
   state.error = undefined;
   state.completedAt = undefined;
   state.conversationHistory = request.conversationHistory;
+  logAgentRunEvent(agentId, 'agent_follow_up', {
+    transcript: request.transcript,
+    captures: request.captures.map(({ label, width, height }) => ({ label, width, height })),
+    model: request.model,
+    history: request.conversationHistory.length
+  });
+  persistAgentStateSnapshot(state, 'follow-up-started');
   safeSend(win, ipcChannels.agentUpdate, state);
 
   const api = new WorkerApi({ workerBaseUrl: settings.workerBaseUrl });
@@ -1617,6 +2064,8 @@ ipcMain.handle(ipcChannels.agentFollowUp, async (_event, agentId: string, reques
     console.error('[clicky:agent] follow-up stream threw', { agentId, error: message });
     state.status = 'error';
     state.error = message;
+    logAgentRunEvent(agentId, 'follow_up_exception', { error: message });
+    persistAgentStateSnapshot(state, 'follow-up-exception');
     safeSend(win, ipcChannels.chatError, message);
     safeSend(win, ipcChannels.agentUpdate, state);
   }

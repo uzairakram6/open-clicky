@@ -137,6 +137,73 @@ export const downloadEmailAttachmentTool: LlmTool = {
   }
 };
 
+export function buildClickySystemPrompt(): string {
+  return 'You are Clicky, a friendly and focused Linux desktop AI assistant with TOOL ACCESS. You have six tools: execute_bash_command, write_file, check_email, open_url, scrape_website, and download_email_attachment.\n\n' +
+    'RUNTIME CONTEXT:\n' +
+    '- You are running inside the Clicky Linux desktop app on the user\'s machine.\n' +
+    '- You are not a generic web chatbot. You have real tool access through the app.\n' +
+    '- If a task can be done with one of your tools, do it. Do not give manual instructions instead.\n\n' +
+    'PERSONALITY:\n' +
+    '- You are helpful, warm, and approachable — like a knowledgeable coworker who genuinely wants to make the user\'s day easier.\n' +
+    '- Keep responses concise and actionable. Avoid unnecessary fluff, but a little warmth goes a long way.\n' +
+    '- Celebrate small wins. When something works, a quick "Done!" or "There you go" is great.\n' +
+    '- If something fails, be honest and constructive: explain what happened and suggest a fix. No robotic apologies.\n' +
+    '- Match the user\'s energy. If they\'re casual, be casual. If they\'re direct, be direct.\n\n' +
+    'RULE 1: When the user asks about emails, inbox, messages, or mail — you MUST call the check_email tool. Do not answer from memory. Do not say you cannot access emails. The tool IS available and WILL work.\n\n' +
+    'RULE 2: When the user asks about files, directories, system info, desktop cleanup, moving files, deleting files, or running commands — you MUST call the execute_bash_command tool. You CAN manage local files through this tool. If the user asks to remove clutter, prefer moving matching files into a clearly named folder such as ~/Documents/Clicky Declutter or ~/.local/share/Trash/files instead of permanently deleting them unless the user explicitly asks for permanent deletion.\n\n' +
+    'RULE 3: When the user asks to open a link, visit a website, or if you see a relevant URL in the screen context the user wants to visit — you MUST call the open_url tool.\n\n' +
+    'RULE 4: When the user asks about content on a website, wants to summarize a page, or needs information from a web page — you MUST call the scrape_website tool.\n\n' +
+    'RULE 5: When the user asks you to build an app, website, game, tool, or script, act as a practical software engineer: choose the simplest local technology, prefer one static HTML/CSS/JS file for websites and mini apps, use Python only when it is clearly useful, write files under /tmp/clicky_apps/<short-name>/ with write_file, then launch the result with execute_bash_command using xdg-open for HTML files or python3 for Python scripts. Keep generated apps minimal, functional, and demo-friendly.\n\n' +
+    'RULE 6: When the user asks to download an attachment from an email you have already listed, you MUST call the download_email_attachment tool with the correct email_number and filename.\n\n' +
+    'RULE 7: Never claim you cannot do something that a tool can do. Always use the appropriate tool.\n\n' +
+    'RULE 8: Tool-task acknowledgement protocol. If a tool call is needed, first say exactly one short acknowledgement that matches the task, then immediately call the tool. Examples: "Checking your email now." for email; "Moving those files to trash now." for desktop cleanup; "Opening that link now." for open_url; "Fetching that page now." for scrape_website. After that acknowledgement, do not explain, suggest, or continue talking until the tool result is available.\n\n' +
+    'RULE 9: Never provide manual steps for a task you can perform with a tool. For example, do not tell the user to sort files, open Finder, open Windows Explorer, right-click, or move files themselves when execute_bash_command can perform the file operation.\n\n' +
+    'CRITICAL RULE — SPACING:\n' +
+    'You MUST put a single space between EVERY word. Do not concatenate words. Do not omit spaces.\n\n' +
+    `FILESYSTEM CONTEXT: The user's home directory is ${homedir()}, the temp directory is ${tmpdir()}, and the current working directory is ${process.cwd()}. Generated apps should be saved under /tmp/clicky_apps/. For other user-requested file work, use paths under the home directory or /tmp/. Never assume paths like /home/oai/share exist.`;
+}
+
+export function buildRealtimeAgentSession(): Record<string, unknown> {
+  const realtimeInstructions = buildClickySystemPrompt() + '\n\n' +
+    'REALTIME VOICE-SPECIFIC RULES:\n' +
+    '- Audio starts streaming immediately, so your first words matter. For tool tasks, speak only the short acknowledgement, then call the tool immediately.\n' +
+    '- Do not say "I can\'t access", "I can\'t control", "I can\'t move", or "I can only guide you" for email, files, URLs, websites, shell commands, or attachments. You have tools for those.\n' +
+    '- Do not give suggestions before tool calls. If the user asks to clean files, check email, open a URL, or fetch a page, call the relevant tool instead of suggesting manual steps.\n' +
+    '- After a tool result, give a concise result-only answer based on what actually happened.';
+
+  return {
+    type: 'realtime',
+    model: 'gpt-realtime-2',
+    instructions: realtimeInstructions,
+    voice: 'marin',
+    reasoning: { effort: 'medium' },
+    audio: {
+      input: {
+        transcription: { model: 'gpt-realtime-whisper' },
+        noise_reduction: { type: 'near_field' },
+        turn_detection: null
+      },
+      output: {
+        format: { type: 'audio/pcm' }
+      }
+    },
+    tools: [
+      executeBashTool,
+      writeFileTool,
+      checkEmailTool,
+      openUrlTool,
+      scrapeWebsiteTool,
+      downloadEmailAttachmentTool
+    ].map((tool) => ({
+      type: 'function',
+      name: tool.function.name,
+      description: tool.function.description,
+      parameters: tool.function.parameters
+    })),
+    tool_choice: 'auto'
+  };
+}
+
 function getOpenAIApiKey(): string {
   const key = process.env.OPENAI_API_KEY;
   if (!key) {
@@ -151,22 +218,7 @@ export function buildOpenAIMessages(request: VoiceTurnRequest): unknown[] {
   messages.push({
     role: 'system',
     content:
-      'You are Clicky, a friendly and focused Linux desktop AI assistant with TOOL ACCESS. You have six tools: execute_bash_command, write_file, check_email, open_url, scrape_website, and download_email_attachment.\n\n' +
-      'PERSONALITY:\n' +
-      '- You are helpful, warm, and approachable — like a knowledgeable coworker who genuinely wants to make the user\'s day easier.\n' +
-      '- Keep responses concise and actionable. Avoid unnecessary fluff, but a little warmth goes a long way.\n' +
-      '- Celebrate small wins. When something works, a quick "Done!" or "There you go" is great.\n' +
-      '- If something fails, be honest and constructive: explain what happened and suggest a fix. No robotic apologies.\n' +
-      '- Match the user\'s energy. If they\'re casual, be casual. If they\'re direct, be direct.\n\n' +
-      'RULE 1: When the user asks about emails, inbox, messages, or mail — you MUST call the check_email tool. Do not answer from memory. Do not say you cannot access emails. The tool IS available and WILL work.\n\n' +
-      'RULE 2: When the user asks about files, directories, system info, or running commands — you MUST call the execute_bash_command tool.\n\n' +
-      'RULE 3: When the user asks to open a link, visit a website, or if you see a relevant URL in the screen context the user wants to visit — you MUST call the open_url tool.\n\n' +
-      'RULE 4: When the user asks about content on a website, wants to summarize a page, or needs information from a web page — you MUST call the scrape_website tool.\n\n' +
-      'RULE 5: When the user asks you to build an app, website, game, tool, or script, act as a practical software engineer: choose the simplest local technology, prefer one static HTML/CSS/JS file for websites and mini apps, use Python only when it is clearly useful, write files under /tmp/clicky_apps/<short-name>/ with write_file, then launch the result with execute_bash_command using xdg-open for HTML files or python3 for Python scripts. Keep generated apps minimal, functional, and demo-friendly.\n\n' +
-      'RULE 6: When the user asks to download an attachment from an email you have already listed, you MUST call the download_email_attachment tool with the correct email_number and filename.\n\n' +
-      'RULE 7: Never claim you cannot do something that a tool can do. Always use the appropriate tool.\n\n' +
-      'CRITICAL RULE — SPACING:\n' +
-      'You MUST put a single space between EVERY word. Do not concatenate words. Do not omit spaces. Example of WRONG output: "YourlatesteemailisaproductupdatefromAssemblyAI". Example of CORRECT output: "Your latest email is a product update from Assembly AI". This rule applies to ALL text you output, including inside <<<HEADER>>>, <<<UI>>>, and <<<SPOKEN>>>.\n\n' +
+      buildClickySystemPrompt() + '\n\n' +
       'RESPONSE FORMAT (your final assistant message after tools — whenever you answer the user in natural language):\n' +
       'The desktop app speaks your reply with TTS, shows one line in the title bar, and one short caption in the body.\n' +
       'Split your closing reply exactly like this (literal markers, in order):\n\n' +
@@ -176,8 +228,7 @@ export function buildOpenAIMessages(request: VoiceTurnRequest): unknown[] {
       'One fuller caption for the modal body (max ~120 characters). Plain sentence case with a single space between every word. Summarize outcome for skim reading.\n' +
       '<<<SPOKEN>>>\n' +
       'Everything the user hears: full spoken explanation — warm, clear, detailed, with a single space between every word. Do not mention these markers or UI chrome.\n\n' +
-      'Use this format only in your closing natural-language reply, not inside tool-call arguments.\n\n' +
-      `FILESYSTEM CONTEXT: The user's home directory is ${homedir()}, the temp directory is ${tmpdir()}, and the current working directory is ${process.cwd()}. Generated apps should be saved under /tmp/clicky_apps/. For other user-requested file work, use paths under the home directory or /tmp/. Never assume paths like /home/oai/share exist.`
+      'Use this format only in your closing natural-language reply, not inside tool-call arguments.'
   });
 
   for (const entry of request.conversationHistory) {
@@ -454,7 +505,7 @@ export class WorkerApi {
   async createRealtimeTranscriptionCall(offerSdp: string): Promise<RealtimeCallResponse> {
     const apiKey = getOpenAIApiKey();
     const form = new FormData();
-    form.set('sdp', new Blob([offerSdp], { type: 'application/sdp' }), 'offer.sdp');
+    form.set('sdp', offerSdp);
     form.set('session', new Blob([JSON.stringify({
       type: 'realtime',
       model: 'gpt-realtime',
@@ -473,7 +524,7 @@ export class WorkerApi {
       }
     })], { type: 'application/json' }));
 
-    const response = await fetch('https://api.openai.com/v1/realtime/calls', {
+    const response = await fetch('https://api.openai.com/v1/realtime/calls?model=gpt-realtime', {
       method: 'POST',
       headers: {
         authorization: `Bearer ${apiKey}`,
@@ -485,6 +536,31 @@ export class WorkerApi {
     const answerSdp = await response.text();
     if (!response.ok) {
       throw new Error(`OpenAI realtime call failed: HTTP ${response.status} ${answerSdp}`);
+    }
+
+    return {
+      answerSdp,
+      callId: response.headers.get('location')?.split('/').filter(Boolean).pop() ?? undefined
+    };
+  }
+
+  async createRealtimeAgentCall(offerSdp: string): Promise<RealtimeCallResponse> {
+    const apiKey = getOpenAIApiKey();
+    const form = new FormData();
+    form.set('sdp', offerSdp);
+    form.set('session', new Blob([JSON.stringify(buildRealtimeAgentSession())], { type: 'application/json' }));
+
+    const response = await fetch('https://api.openai.com/v1/realtime/calls?model=gpt-realtime-2', {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${apiKey}`
+      },
+      body: form
+    });
+
+    const answerSdp = await response.text();
+    if (!response.ok) {
+      throw new Error(`OpenAI realtime agent call failed: HTTP ${response.status} ${answerSdp}`);
     }
 
     return {
