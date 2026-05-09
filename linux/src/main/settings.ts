@@ -38,6 +38,11 @@ export async function saveSettings(settings: AppSettings): Promise<AppSettings> 
     selectedCaptureSourceLabel: settings.selectedCaptureSourceLabel,
     onboarded: settings.onboarded,
     email: settings.email
+      ? {
+          ...settings.email,
+          password: ''
+        }
+      : undefined
   };
   await writeFile(settingsPath(), JSON.stringify(sanitized, null, 2));
   return sanitized;
