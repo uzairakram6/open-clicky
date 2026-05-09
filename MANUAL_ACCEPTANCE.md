@@ -1,4 +1,4 @@
-# Linux Clicky V1 Manual Acceptance
+# Open Clicky V1 Manual Acceptance
 
 Run this matrix on real desktop sessions before tagging V1. The Electron build and unit tests can verify packaging and contracts, but tray behavior, global shortcuts, PipeWire capture, mic permissions, and playback need real Linux desktops.
 
@@ -21,8 +21,8 @@ Run this matrix on real desktop sessions before tagging V1. The Electron build a
 2. Install the deb or run the AppImage:
 
    ```sh
-   sudo apt install ./dist/linux-clicky_0.1.0_amd64.deb
-   ./dist/Clicky-0.1.0.AppImage
+   sudo apt install ./dist/open-clicky_0.1.0_amd64.deb
+   ./dist/open-clicky-0.1.0.AppImage
    ```
 
 3. Open Clicky from the tray menu and set the Worker base URL.

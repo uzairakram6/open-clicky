@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { ipcChannels } from './ipcChannels';
 
 describe('IPC channel contract', () => {
-  it('defines the renderer/main channels used by Clicky V1', () => {
+  it('defines the renderer/main channels used by Open Clicky V1', () => {
     expect(ipcChannels).toEqual({
       settingsGet: 'settings:get',
       settingsSet: 'settings:set',

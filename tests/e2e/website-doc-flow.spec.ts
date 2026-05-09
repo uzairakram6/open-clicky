@@ -17,7 +17,7 @@ type AgentStateSnapshot = {
   generatedAppPath?: string;
 };
 
-test.describe('Clicky Word document website flow', () => {
+test.describe('Open Clicky Word document website flow', () => {
   test.skip(
     process.env.CLICKY_REAL_E2E !== '1',
     'Skipped: set CLICKY_REAL_E2E=1 to run real OpenAI/tool flow'
@@ -40,7 +40,7 @@ test.describe('Clicky Word document website flow', () => {
             }) => Promise<string>;
           };
         };
-        if (!w.clicky) throw new Error('Clicky preload API missing');
+        if (!w.clicky) throw new Error('Open Clicky preload API missing');
         return w.clicky.spawnAgent({
           transcript: `Read this Word document and tell me what landing page it describes: ${path}`,
           captures: [],
@@ -66,7 +66,7 @@ test.describe('Clicky Word document website flow', () => {
             }) => Promise<void>;
           };
         };
-        if (!w.clicky) throw new Error('Clicky preload API missing');
+        if (!w.clicky) throw new Error('Open Clicky preload API missing');
         await w.clicky.followUp(id, {
           transcript: 'Build that into a website and open it in a Chrome tab.',
           captures: [],

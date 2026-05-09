@@ -4,7 +4,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { launchE2EApp } from './fixtures';
 
-test.describe('Clicky structured tool loop', () => {
+test.describe('Open Clicky structured tool loop', () => {
   test('repairs through a real tool result instead of fake user recursion', async () => {
     const filePath = '/tmp/clicky-e2e-read-file.txt';
     await writeFile(filePath, 'Azar wants a minimal coffee shop landing page app.', 'utf8');
@@ -22,7 +22,7 @@ test.describe('Clicky structured tool loop', () => {
             }) => Promise<string>;
           };
         };
-        if (!w.clicky) throw new Error('Clicky preload API missing');
+        if (!w.clicky) throw new Error('Open Clicky preload API missing');
         return w.clicky.spawnAgent({
           transcript: `Read ${path} and tell me what Azar wants built.`,
           captures: [],
@@ -60,7 +60,7 @@ test.describe('Clicky structured tool loop', () => {
             }) => Promise<string>;
           };
         };
-        if (!w.clicky) throw new Error('Clicky preload API missing');
+        if (!w.clicky) throw new Error('Open Clicky preload API missing');
         return w.clicky.spawnAgent({
           transcript: 'Build a coffee shop landing page website and open it in a chrome tab.',
           captures: [],
@@ -109,7 +109,7 @@ test.describe('Clicky structured tool loop', () => {
             }) => Promise<string>;
           };
         };
-        if (!w.clicky) throw new Error('Clicky preload API missing');
+        if (!w.clicky) throw new Error('Open Clicky preload API missing');
         return w.clicky.spawnAgent({
           transcript: 'Turn into a website and open it up in a chrome tab',
           captures: [],
@@ -163,7 +163,7 @@ test.describe('Clicky structured tool loop', () => {
             }) => Promise<string>;
           };
         };
-        if (!w.clicky) throw new Error('Clicky preload API missing');
+        if (!w.clicky) throw new Error('Open Clicky preload API missing');
         return w.clicky.spawnAgent({
           transcript: `Open ${path}`,
           captures: [],
@@ -210,7 +210,7 @@ test.describe('Clicky structured tool loop', () => {
             }) => Promise<string>;
           };
         };
-        if (!w.clicky) throw new Error('Clicky preload API missing');
+        if (!w.clicky) throw new Error('Open Clicky preload API missing');
         return w.clicky.spawnAgent({
           transcript: `Create ${path} and tell me when it is done.`,
           captures: [],

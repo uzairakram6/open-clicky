@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for helping improve Linux Clicky.
+Thanks for helping improve Open Clicky.
 
 ## Development Workflow
 

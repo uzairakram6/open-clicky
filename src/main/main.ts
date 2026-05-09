@@ -348,7 +348,7 @@ function pickAgentColor(): string {
 
 const hasSingleInstanceLock = isE2EMode() ? true : app.requestSingleInstanceLock();
 if (!hasSingleInstanceLock) {
-  console.log('[clicky:main] another Clicky instance is already running; exiting this launcher process');
+  console.log('[clicky:main] another Open Clicky instance is already running; exiting this launcher process');
   app.quit();
 } else {
   app.on('second-instance', (_event, argv) => {
@@ -441,7 +441,7 @@ function createTray(): void {
     );
       tray = new Tray(icon);
     if (!tray.isDestroyed()) {
-      tray.setToolTip('Clicky');
+      tray.setToolTip('Open Clicky');
       tray.on('click', () => {
         console.log('[clicky:tray] tray clicked; opening recorder orb');
         openRecorderOrb();
@@ -638,7 +638,7 @@ function createAgentWindow(agentId: string): BrowserWindow {
     skipTaskbar: true,
     resizable: false,
     show: false,
-    title: 'Clicky Agent',
+    title: 'Open Clicky Agent',
     webPreferences: {
       preload: join(__dirname, '../preload/preload.cjs'),
       nodeIntegration: false,
@@ -1061,7 +1061,7 @@ function buildFallbackWebsiteHtml(sourceText: string, transcript: string): strin
     <section class="card">
       <div class="hero">
         <div>
-          <div class="eyebrow">Built by Clicky</div>
+          <div class="eyebrow">Open Clicky</div>
           <h1>${htmlEscape(title)}</h1>
           <p>${htmlEscape(subtitle)}</p>
           <a class="cta" href="#menu">Explore the concept</a>
@@ -1616,7 +1616,7 @@ async function registerGnomeWaylandShortcut(): Promise<void> {
     if (nextPaths.length !== paths.length) {
       await execFileOutput('gsettings', ['set', 'org.gnome.settings-daemon.plugins.media-keys', 'custom-keybindings', formatGSettingsStringList(nextPaths)]);
     }
-    await execFileOutput('gsettings', ['set', `org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:${GNOME_CLICKY_SHORTCUT_PATH}`, 'name', 'Clicky push to talk']);
+    await execFileOutput('gsettings', ['set', `org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:${GNOME_CLICKY_SHORTCUT_PATH}`, 'name', 'Open Clicky push to talk']);
     await execFileOutput('gsettings', ['set', `org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:${GNOME_CLICKY_SHORTCUT_PATH}`, 'command', command]);
     await execFileOutput('gsettings', ['set', `org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:${GNOME_CLICKY_SHORTCUT_PATH}`, 'binding', binding]);
     console.log('[clicky:hotkey] GNOME Wayland shortcut registered', { binding, command });

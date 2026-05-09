@@ -1,4 +1,4 @@
-# Linux Clicky V1 Plan
+# Open Clicky V1 Plan
 
 ## Summary
 
@@ -40,7 +40,7 @@ References used: Electron globalShortcut with Wayland GlobalShortcutsPortal, Ele
 
 ## Behavior
 
-- Tray icon opens a compact Clicky panel. Because Linux tray activation differs by desktop, also provide a context menu with Show, Start/Stop Recording, Settings, Quit.
+- Tray icon opens a compact Open Clicky panel. Because Linux tray activation differs by desktop, also provide a context menu with Show, Start/Stop Recording, Settings, Quit.
 - Toggle shortcut starts recording; pressing it again stops recording and sends the turn. Default shortcut: Ctrl+Alt+Space.
 - First screen capture uses the system picker where required. V1 captures the selected screen, scales the JPEG to max dimension 1280, and labels it as the selected Linux screen.
 - The panel shows recording state, audio level, live transcript, streamed Claude response, model selector, capture-source status, and error states.

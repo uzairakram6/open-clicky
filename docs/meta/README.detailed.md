@@ -1,6 +1,6 @@
-# 🎙️ Clicky — Linux Voice Assistant
+# 🎙️ Open Clicky — Linux Voice Assistant
 
-**Clicky** is a privacy-aware, voice-driven AI assistant for Linux desktops. It lives in your system tray, listens on a global hotkey, and gives you an AI agent that can see your screen, run commands, write files, check email, browse the web, and answer questions — all by speaking.
+**Open Clicky** is a privacy-aware, voice-driven AI assistant for Linux desktops. It lives in your system tray, listens on a global hotkey, and gives you an AI agent that can see your screen, run commands, write files, check email, browse the web, and answer questions — all by speaking.
 
 Built with Electron, React, TypeScript, and Vite. Supports **Wayland** and **X11**.
 
@@ -79,8 +79,8 @@ Built with Electron, React, TypeScript, and Vite. Supports **Wayland** and **X11
 
 ```bash
 # Clone the repo
-git clone <repo-url> linux-clicky
-cd linux-clicky
+git clone <repo-url> open-clicky
+cd open-clicky
 
 # Install dependencies
 npm install
@@ -99,15 +99,15 @@ npm run build
 ```
 
 This produces:
-- `dist/Clicky-<version>.AppImage`
-- `dist/linux-clicky_<version>_amd64.deb`
+- `dist/open-clicky-<version>.AppImage`
+- `dist/open-clicky_<version>_amd64.deb`
 
 ### Install the Package
 
 ```bash
-sudo apt install ./dist/linux-clicky_0.1.0_amd64.deb
+sudo apt install ./dist/open-clicky_0.1.0_amd64.deb
 # or
-./dist/Clicky-0.1.0.AppImage
+./dist/open-clicky-0.1.0.AppImage
 ```
 
 ---
@@ -122,7 +122,7 @@ sudo apt install ./dist/linux-clicky_0.1.0_amd64.deb
 
 ### System Tray
 
-Right-click the Clicky tray icon for:
+Right-click the Open Clicky tray icon for:
 - **Settings** — configure Worker URL, model, screen source
 - **Open Clicky Recorder** — manually open the recording orb
 - **Quit** — exit the application
@@ -246,7 +246,7 @@ interface AgentState {
 
 ## 🔧 AI Tools
 
-The Clicky agent has access to six tools, declared as OpenAI function-calling tools:
+The Open Clicky agent has access to six tools, declared as OpenAI function-calling tools:
 
 | Tool | Description |
 |---|---|
@@ -364,4 +364,4 @@ Tests use **Vitest** with Node environment. They cover:
 
 ## 📄 License
 
-Clicky is provided under the MIT License. See `LICENSE` for details.
+Open Clicky is provided under the MIT License. See `LICENSE` for details.

@@ -62,7 +62,7 @@ export function cleanAcknowledgementSpeech(text: string, maxChars = MAX_SPOKEN_A
 function cleanTranscriptForIntent(transcript: string): string {
   return cleanAcknowledgementSpeech(transcript)
     .replace(/\s+/g, ' ')
-    .replace(/^(?:hey\s+)?clicky[\s,.:;-]+/i, '')
+    .replace(/^(?:hey\s+)?(?:open\s+)?clicky[\s,.:;-]+/i, '')
     .replace(/^(?:please\s+)?(?:can you|could you|would you|will you)\s+/i, '')
     .replace(/^(?:please\s+)?(?:go and|go|do|start|begin)\s+/i, '')
     .trim()

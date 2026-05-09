@@ -1,17 +1,17 @@
 {
-  "name": "linux-clicky",
+  "name": "open-clicky",
   "version": "0.1.0",
-  "description": "Linux Electron client for Clicky voice assistant",
-  "homepage": "https://github.com/clicky-ai/linux-clicky#readme",
+  "description": "Open-source Linux desktop voice assistant (Electron)",
+  "homepage": "https://github.com/uzairakram6/open-clicky#readme",
   "repository": {
     "type": "git",
-    "url": "https://github.com/clicky-ai/linux-clicky.git"
+    "url": "https://github.com/uzairakram6/open-clicky.git"
   },
   "bugs": {
-    "url": "https://github.com/clicky-ai/linux-clicky/issues"
+    "url": "https://github.com/uzairakram6/open-clicky/issues"
   },
   "license": "MIT",
-  "author": "Clicky contributors",
+  "author": "Open Clicky contributors",
   "keywords": [
     "electron",
     "linux",
@@ -55,8 +55,10 @@
     "vitest": "^3.0.0"
   },
   "build": {
-    "appId": "com.clicky.linux",
-    "productName": "Clicky",
+    "appId": "com.openclicky.app",
+    "productName": "Open Clicky",
+    "executableName": "open-clicky",
+    "artifactName": "open-clicky-${version}.${ext}",
     "files": [
       "dist/main/**/*",
       "dist/preload/**/*",
@@ -75,7 +77,7 @@
         "deb"
       ],
       "category": "Utility",
-      "maintainer": "Clicky contributors"
+      "maintainer": "Open Clicky contributors"
     }
   }
 }

@@ -11,7 +11,7 @@ type AgentSnapshot = {
   commands?: string[];
 };
 
-test.describe('Clicky realtime acknowledgement flow', () => {
+test.describe('Open Clicky realtime acknowledgement flow', () => {
   test.skip(
     process.env.CLICKY_REAL_E2E !== '1',
     'Skipped: set CLICKY_REAL_E2E=1 to run real realtime acknowledgement smoke test'

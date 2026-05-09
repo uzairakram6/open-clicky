@@ -9,7 +9,7 @@
 
 import { test, expect } from '@playwright/test';
 
-test.describe('Clicky real smoke test', () => {
+test.describe('Open Clicky real smoke test', () => {
   test.skip(
     !process.env.CLICKY_SMOKE || process.env.CLICKY_SMOKE !== '1',
     'Skipped: set CLICKY_SMOKE=1 to run real smoke tests'

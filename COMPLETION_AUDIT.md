@@ -1,4 +1,4 @@
-# Linux Clicky V1 Completion Audit
+# Open Clicky V1 Completion Audit
 
 This audit maps `../plan.md` requirements to concrete artifacts and verification evidence.
 
@@ -7,7 +7,7 @@ This audit maps `../plan.md` requirements to concrete artifacts and verification
 | Requirement | Evidence | Status |
 | --- | --- | --- |
 | Electron + TypeScript + React/Vite app at repo root | `package.json`, `vite.config.ts`, `vite.main.config.ts`, `vite.preload.config.ts`, `src/main`, `src/preload`, `src/renderer` | Implemented |
-| Package AppImage and deb | `npm run build`, `dist/Clicky-0.1.0.AppImage`, `dist/linux-clicky_0.1.0_amd64.deb` | Implemented |
+| Package AppImage and deb | `npm run build`, `dist/open-clicky-0.1.0.AppImage`, `dist/open-clicky_0.1.0_amd64.deb` | Implemented |
 | Keep API keys server-side through Worker | `src/main/workerApi.ts`; local settings contain only Worker URL and preferences | Implemented |
 | Store only non-secret settings | `src/main/settings.ts` sanitizes settings before write | Implemented |
 | Main process owns tray, shortcut, Worker calls, SSE, IPC streaming | `src/main/main.ts`, `src/main/workerApi.ts`, `src/main/sse.ts` | Implemented |
@@ -47,7 +47,7 @@ Last local verification run:
 npm test
 npm run build
 npm run smoke:packaged
-dpkg-deb --info dist/linux-clicky_0.1.0_amd64.deb
+dpkg-deb --info dist/open-clicky_0.1.0_amd64.deb
 ```
 
 Observed status:

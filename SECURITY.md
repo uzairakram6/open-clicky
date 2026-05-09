@@ -2,7 +2,7 @@
 
 ## Supported Versions
 
-Linux Clicky is pre-1.0. Security fixes are handled on the default branch.
+Open Clicky is pre-1.0. Security fixes are handled on the default branch.
 
 ## Reporting A Vulnerability
 
@@ -10,7 +10,7 @@ Please report security issues privately to the maintainers before opening a publ
 
 ## Security Model
 
-Linux Clicky is a local desktop assistant. It can call OpenAI APIs and can expose local capabilities to an agent tool loop, including shell execution, file reads, generated file writes, URL/file opening, screen capture, website scraping, and IMAP email access.
+Open Clicky is a local desktop assistant. It can call OpenAI APIs and can expose local capabilities to an agent tool loop, including shell execution, file reads, generated file writes, URL/file opening, screen capture, website scraping, and IMAP email access.
 
 Treat the app as trusted local software with agentic permissions. Review code and configuration before running it on sensitive machines.
 

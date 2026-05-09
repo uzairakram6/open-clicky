@@ -5,7 +5,7 @@ function log(msg: string) {
   process.stdout.write('[E2E:test] ' + msg + '\n');
 }
 
-test.describe('Clicky E2E — "Check my emails" real flow', () => {
+test.describe('Open Clicky E2E — "Check my emails" real flow', () => {
   test('full pipeline: orb → transcript → agent → OpenAI → IMAP → response', async () => {
     const { electronApp, mainWindow, teardown } = await launchE2EApp();
     const agentStates: Array<Record<string, unknown>> = [];

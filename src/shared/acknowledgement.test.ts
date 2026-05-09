@@ -3,6 +3,12 @@ import { buildTaskAcknowledgement, cleanAcknowledgementSpeech } from './acknowle
 
 describe('buildTaskAcknowledgement', () => {
   it('acknowledges a build task without echoing the raw transcript', () => {
+    expect(buildTaskAcknowledgement('Open Clicky, go and build a timer app')).toBe(
+      "Got it. I'll start building that now."
+    );
+  });
+
+  it('acknowledges a build task when invoked with the legacy wake word', () => {
     expect(buildTaskAcknowledgement('Clicky, go and build a timer app')).toBe(
       "Got it. I'll start building that now."
     );

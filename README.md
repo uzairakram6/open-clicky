@@ -1,6 +1,6 @@
-# Linux Clicky
+# Open Clicky
 
-Linux Clicky is an Electron desktop client for a voice-first AI assistant on Linux. It opens a small cursor-anchored recorder, captures optional screen context, streams agent progress in compact widgets, and can use local tools for files, websites, email, and generated mini apps.
+Open Clicky is an Electron desktop client for a voice-first AI assistant on Linux. It opens a small cursor-anchored recorder, captures optional screen context, streams agent progress in compact widgets, and can use local tools for files, websites, email, and generated mini apps.
 
 A longer overview (features, architecture, packaging) lives in [docs/meta/README.detailed.md](docs/meta/README.detailed.md).
 
@@ -78,7 +78,7 @@ Real OpenAI contract and smoke flows require `OPENAI_API_KEY`. Some tests intent
 
 ## Security And Privacy
 
-Linux Clicky is a local desktop agent with powerful tools. Depending on the prompt and enabled settings, it can read local files, write files under `/tmp/clicky_apps`, open URLs/files, inspect recent email through IMAP, and execute shell commands. Review prompts, logs, and tool behavior before using it with sensitive data.
+Open Clicky is a local desktop agent with powerful tools. Depending on the prompt and enabled settings, it can read local files, write files under `/tmp/clicky_apps`, open URLs/files, inspect recent email through IMAP, and execute shell commands. Review prompts, logs, and tool behavior before using it with sensitive data.
 
 Settings are stored in Electron user data. Email passwords are not written back to settings by the current serializer; prefer app-specific passwords or dedicated test accounts for IMAP use.
 

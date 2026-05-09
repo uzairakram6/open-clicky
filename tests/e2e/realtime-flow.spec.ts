@@ -19,7 +19,7 @@ const DEFAULT_TRANSCRIPTS: Record<Scenario, string> = {
   generic: 'What can you help me with?'
 };
 
-test.describe('Clicky realtime flow smoke', () => {
+test.describe('Open Clicky realtime flow smoke', () => {
   test.skip(
     process.env.CLICKY_REAL_E2E !== '1',
     'Skipped: set CLICKY_REAL_E2E=1 to run real realtime flow smoke test'

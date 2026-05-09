@@ -5,7 +5,7 @@ cd "$(dirname "$0")/.."
 
 port="${CLICKY_SMOKE_CDP_PORT:-9233}"
 session="${CLICKY_SMOKE_SESSION:-clicky-smoke}"
-app="./dist/linux-unpacked/linux-clicky"
+app="./dist/linux-unpacked/open-clicky"
 
 if [[ ! -x "$app" ]]; then
   echo "Missing packaged app at $app. Run npm run build first." >&2
@@ -31,7 +31,7 @@ for _ in {1..40}; do
 done
 
 if [[ "$connected" != "1" ]]; then
-  echo "Unable to connect to Clicky CDP port $port" >&2
+  echo "Unable to connect to Open Clicky CDP port $port" >&2
   cat /tmp/clicky-smoke.log >&2 || true
   exit 1
 fi

@@ -30,9 +30,9 @@ const DEFAULT_SEED_EMAILS: EmailSummary[] = [
   },
   {
     from: 'GitHub <noreply@github.com>',
-    subject: '[clicky/linux-clicky] New pull request #42',
+    subject: '[open-clicky/open-clicky] New pull request #42',
     date: new Date(Date.now() - 7200000).toISOString(),
-    preview: 'A new pull request has been opened in clicky/linux-clicky by uzair. Title: Add E2E test infrastructure.',
+    preview: 'A new pull request has been opened in open-clicky/open-clicky by uzair. Title: Add E2E test infrastructure.',
     attachments: [],
     uid: 1002
   },
@@ -55,7 +55,7 @@ export function defaultFakeApiConfig(): Required<Pick<FakeApiConfig, 'seedEmails
       '<<<UI>>>\n' +
       'You have 3 recent emails. Alice sent a Q3 Budget Review, GitHub notified about PR #42, and Bob shared Sprint Planning notes.\n' +
       '<<<SPOKEN>>>\n' +
-      "I checked your inbox and found 3 recent emails. The most recent is from Alice Johnson with the Q3 Budget Review — she attached a spreadsheet. Next is a GitHub notification about pull request #42 on the clicky repo. And Bob Smith sent over the sprint planning meeting notes. Would you like me to open any of these?"
+      "I checked your inbox and found 3 recent emails. The most recent is from Alice Johnson with the Q3 Budget Review — she attached a spreadsheet. Next is a GitHub notification about pull request #42 on the open-clicky repo. And Bob Smith sent over the sprint planning meeting notes. Would you like me to open any of these?"
   };
 }
 
