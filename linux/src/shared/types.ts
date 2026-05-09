@@ -63,6 +63,7 @@ export interface ChatStreamEvent {
   type: 'chunk' | 'done' | 'error' | 'tool_call';
   text?: string;
   error?: string;
+  id?: string;
   name?: string;
   arguments?: string;
 }
@@ -97,6 +98,9 @@ export interface RealtimeToolRequest {
 export interface RealtimeToolResponse {
   output: string;
   commandLabel?: string;
+  kind?: 'sideEffectOnly' | 'contentBearing' | 'failed';
+  done?: boolean;
+  userMessage?: string;
 }
 
 export interface RecordedAudioPayload {
@@ -147,6 +151,8 @@ export interface AgentState {
   captures: ScreenCapturePayload[];
   color?: string;
   emails?: EmailSummary[];
+  lastDownloadedPath?: string;
+  generatedAppPath?: string;
 }
 
 export interface WindowContext {

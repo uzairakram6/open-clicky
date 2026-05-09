@@ -23,6 +23,7 @@ describe('IPC channel contract', () => {
       chatDone: 'chat:done',
       chatError: 'chat:error',
       ttsAudio: 'tts:audio',
+      ttsStop: 'tts:stop',
       ttsError: 'tts:error',
       agentSpawn: 'agent:spawn',
       agentSpawnRealtime: 'agent:spawnRealtime',

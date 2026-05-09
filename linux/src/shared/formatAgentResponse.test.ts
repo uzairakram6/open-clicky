@@ -18,8 +18,8 @@ describe('formatAgentResponseForDisplay', () => {
   });
 
   it('spaces out long glued letter-only captions after formatting', () => {
-    const out = formatAgentResponseForDisplay('yournewestemaillookslikeadocumentattachment');
-    expect(out).toBe('yournewestemaillookslikeadocumentattachment');
+    const out = formatAgentResponseForDisplay('tasksforaminimalcoffeeshoplandingpageapp');
+    expect(out).toBe('tasks for a minimal coffee shop landing page app');
   });
 
   it('does not split valid words while trying to repair display text', () => {

@@ -1,4 +1,5 @@
 import type { AgentState, ScreenCapturePayload } from '../shared/types';
+import { stopAudioPlayback } from './playAudio';
 
 export interface RealtimeAgentSessionOptions {
   agentId: string;
@@ -48,8 +49,11 @@ export class RealtimeAgentSession {
   private stopped = false;
   private pendingToolCalls = new Map<number, { callId: string; name: string; arguments: string }>();
   private emailFallbackAttempted = false;
+  private emailToolSatisfied = false;
   private fileCleanupFallbackAttempted = false;
+  private fileCleanupToolSatisfied = false;
   private suppressAudioUntilToolResult = false;
+  private toolPreambleSpoken = false;
   private responseDeltaLogBuffer = '';
   private responseDeltaLogTimer?: ReturnType<typeof setTimeout>;
 
@@ -66,7 +70,6 @@ export class RealtimeAgentSession {
     this.suppressAudioUntilToolResult = shouldRequireToolBeforeSpeaking(this.state.transcript);
     if (this.suppressAudioUntilToolResult) {
       this.patchState(this.progressPatchForTranscript(this.state.transcript));
-      this.speakDeterministicAcknowledgement(this.state.transcript);
     }
     this.reportLog('realtime_session_start', {
       transcript: this.state.transcript,
@@ -111,7 +114,7 @@ export class RealtimeAgentSession {
     logRealtime('data channel open', { agentId: this.options.agentId });
     this.patchState({ displayHeader: 'Thinking', summary: 'Processing...' });
     this.sendInitialUserMessage();
-    this.send({ type: 'response.create' });
+    this.send(this.createInitialResponseRequest());
     logRealtime('response.create sent', { agentId: this.options.agentId });
   }
 
@@ -159,9 +162,9 @@ export class RealtimeAgentSession {
       return;
     }
 
-    if ((payload.type === 'response.audio_transcript.delta' || payload.type === 'response.text.delta') && payload.delta) {
+    if (isResponseTextDelta(payload.type) && payload.delta) {
       this.responseText += payload.delta;
-      this.bufferResponseDeltaLog(payload.type, payload.delta);
+      this.bufferResponseDeltaLog(payload.type ?? 'response.delta', payload.delta);
       if (this.suppressAudioUntilToolResult) {
         this.reportLog('realtime_response_blocked_until_tool', {
           source: payload.type,
@@ -183,11 +186,13 @@ export class RealtimeAgentSession {
     if (payload.type === 'response.function_call_arguments.delta' && payload.delta) {
       const index = payload.output_index ?? 0;
       const current = this.pendingToolCalls.get(index) ?? { callId: payload.call_id ?? '', name: payload.name ?? '', arguments: '' };
+      const toolName = payload.name ?? current.name;
       this.pendingToolCalls.set(index, {
         callId: payload.call_id ?? current.callId,
-        name: payload.name ?? current.name,
+        name: toolName,
         arguments: `${current.arguments}${payload.delta}`
       });
+      this.speakRealtimePreambleIfSafe(toolName);
       return;
     }
 
@@ -199,6 +204,7 @@ export class RealtimeAgentSession {
         name: payload.name ?? current.name,
         arguments: payload.arguments ?? current.arguments
       });
+      this.speakRealtimePreambleIfSafe(payload.name ?? current.name);
       return;
     }
 
@@ -214,14 +220,17 @@ export class RealtimeAgentSession {
         suppressAudioUntilToolResult: this.suppressAudioUntilToolResult
       });
       if (calls.length > 0) {
+        this.speakRealtimePreambleIfSafe(calls[0]?.name ?? '');
         await this.runToolCalls(calls);
         return;
       }
-      if (shouldForceEmailToolCall(this.finalTranscript || this.state.transcript) && !this.emailFallbackAttempted) {
+      if (shouldForceEmailToolCall(this.finalTranscript || this.state.transcript) && !this.emailFallbackAttempted && !this.emailToolSatisfied) {
+        this.speakRealtimePreambleIfSafe('check_email');
         await this.runEmailToolFallback();
         return;
       }
-      if (shouldForceFileCleanupToolCall(this.finalTranscript || this.state.transcript) && !this.fileCleanupFallbackAttempted) {
+      if (shouldForceFileCleanupToolCall(this.finalTranscript || this.state.transcript) && !this.fileCleanupFallbackAttempted && !this.fileCleanupToolSatisfied) {
+        this.speakRealtimePreambleIfSafe('execute_bash_command');
         await this.runFileCleanupToolFallback();
         return;
       }
@@ -262,6 +271,12 @@ export class RealtimeAgentSession {
         name: call.name,
         arguments: this.clip(call.arguments, 1200)
       });
+      if (call.name === 'check_email') {
+        this.emailToolSatisfied = true;
+      }
+      if (call.name === 'execute_bash_command' && shouldForceFileCleanupToolCall(this.finalTranscript || this.state.transcript)) {
+        this.fileCleanupToolSatisfied = true;
+      }
       const result = await window.clicky.executeRealtimeTool({
         agentId: this.options.agentId,
         name: call.name,
@@ -270,10 +285,14 @@ export class RealtimeAgentSession {
       this.reportLog('realtime_tool_result_renderer', {
         name: call.name,
         commandLabel: result.commandLabel,
-        output: this.clip(result.output, 1200)
+        output: this.clip(result.output, 1200),
+        kind: result.kind,
+        done: result.done,
+        userMessage: result.userMessage
       });
-      if (result.commandLabel) {
-        this.patchState({ commands: [...this.state.commands, result.commandLabel] });
+      if (result.done && result.kind === 'sideEffectOnly') {
+        this.finishLocalToolCompletion(result.userMessage || result.output || 'Done.');
+        return;
       }
       this.send({
         type: 'conversation.item.create',
@@ -287,12 +306,36 @@ export class RealtimeAgentSession {
     this.emailFallbackAttempted = false;
     this.responseText = '';
     this.suppressAudioUntilToolResult = false;
+    this.toolPreambleSpoken = false;
     if (this.audio) {
+      stopAudioPlayback();
       this.audio.muted = false;
       void this.audio.play().catch(() => undefined);
     }
     this.reportLog('realtime_audio_unmuted_after_tools');
     this.send({ type: 'response.create' });
+  }
+
+  private finishLocalToolCompletion(message: string): void {
+    const clean = message.trim() || 'Done.';
+    this.stopRemoteAudio('side-effect-tool-completed');
+    this.responseText = '';
+    this.suppressAudioUntilToolResult = false;
+    this.toolPreambleSpoken = false;
+    this.reportLog('realtime_side_effect_tool_completed', { message: clean });
+    this.patchState({
+      status: 'done',
+      response: clean,
+      displayHeader: this.clip(clean, 48),
+      displayCaption: this.clip(clean, 160),
+      summary: this.clip(clean, 200),
+      completedAt: Date.now(),
+      conversationHistory: [
+        ...this.state.conversationHistory,
+        { role: 'user', content: this.finalTranscript || this.state.transcript },
+        { role: 'assistant', content: clean }
+      ]
+    });
   }
 
   private async runEmailToolFallback(): Promise<void> {
@@ -308,9 +351,6 @@ export class RealtimeAgentSession {
       commandLabel: result.commandLabel,
       output: this.clip(result.output, 1200)
     });
-    if (result.commandLabel) {
-      this.patchState({ commands: [...this.state.commands, result.commandLabel] });
-    }
     this.responseText = '';
     this.send({
       type: 'conversation.item.create',
@@ -326,7 +366,9 @@ export class RealtimeAgentSession {
       }
     });
     this.suppressAudioUntilToolResult = false;
+    this.toolPreambleSpoken = false;
     if (this.audio) {
+      stopAudioPlayback();
       this.audio.muted = false;
       void this.audio.play().catch(() => undefined);
     }
@@ -370,12 +412,11 @@ export class RealtimeAgentSession {
       commandLabel: result.commandLabel,
       output: this.clip(result.output, 1200)
     });
-    if (result.commandLabel) {
-      this.patchState({ commands: [...this.state.commands, result.commandLabel] });
-    }
     const finalResponse = buildFileCleanupFinalResponse(result.output);
     this.suppressAudioUntilToolResult = false;
+    this.toolPreambleSpoken = false;
     this.stopRemoteAudio('file-cleanup-deterministic-final');
+    stopAudioPlayback();
     this.responseText = '';
     this.reportLog('realtime_file_cleanup_deterministic_final', { response: finalResponse });
     this.patchState({
@@ -398,19 +439,25 @@ export class RealtimeAgentSession {
 
   private extractToolCalls(payload: RealtimeEvent): Array<{ callId: string; name: string; arguments: string }> {
     const calls: Array<{ callId: string; name: string; arguments: string }> = [];
+    const seenCallIds = new Set<string>();
+    const pushCall = (call: { callId: string; name: string; arguments: string }) => {
+      if (seenCallIds.has(call.callId)) return;
+      seenCallIds.add(call.callId);
+      calls.push(call);
+    };
     for (const call of this.pendingToolCalls.values()) {
       if (call.callId && call.name) {
-        calls.push(call);
+        pushCall(call);
       }
     }
     this.pendingToolCalls.clear();
     for (const item of payload.response?.output ?? []) {
       if (item.type === 'function_call' && item.call_id && item.name) {
-        calls.push({ callId: item.call_id, name: item.name, arguments: item.arguments ?? '{}' });
+        pushCall({ callId: item.call_id, name: item.name, arguments: item.arguments ?? '{}' });
       }
     }
     if (payload.item?.call_id && payload.item.name) {
-      calls.push({ callId: payload.item.call_id, name: payload.item.name, arguments: payload.item.arguments ?? '{}' });
+      pushCall({ callId: payload.item.call_id, name: payload.item.name, arguments: payload.item.arguments ?? '{}' });
     }
     return calls;
   }
@@ -429,6 +476,18 @@ export class RealtimeAgentSession {
   }
 
   private sendInitialUserMessage(): void {
+    const content = this.buildInitialUserContent();
+    this.send({
+      type: 'conversation.item.create',
+      item: {
+        type: 'message',
+        role: 'user',
+        content
+      }
+    });
+  }
+
+  private buildInitialUserContent(): Array<Record<string, string>> {
     const content: Array<Record<string, string>> = [
       {
         type: 'input_text',
@@ -445,14 +504,7 @@ export class RealtimeAgentSession {
         image_url: `data:image/jpeg;base64,${capture.jpegBase64}`
       });
     }
-    this.send({
-      type: 'conversation.item.create',
-      item: {
-        type: 'message',
-        role: 'user',
-        content
-      }
-    });
+    return content;
   }
 
   private sendScreenshot(capture: ScreenCapturePayload): void {
@@ -473,6 +525,20 @@ export class RealtimeAgentSession {
         ]
       }
     });
+  }
+
+  private createInitialResponseRequest(): unknown {
+    if (!this.suppressAudioUntilToolResult) {
+      return { type: 'response.create' };
+    }
+
+    return {
+      type: 'response.create',
+      response: {
+        output_modalities: ['text'],
+        tool_choice: 'required'
+      }
+    };
   }
 
   private waitForConnected(): Promise<void> {
@@ -566,6 +632,35 @@ export class RealtimeAgentSession {
     this.pc?.close();
   }
 
+  private speakRealtimePreambleIfSafe(toolName: string): void {
+    if (!this.suppressAudioUntilToolResult || this.toolPreambleSpoken) return;
+    const preamble = extractShortPreamble(this.responseText);
+    if (!preamble) return;
+    const blockReason = blockedPreambleReason(preamble, this.finalTranscript || this.state.transcript, toolName);
+    if (blockReason) {
+      this.toolPreambleSpoken = true;
+      this.reportLog('realtime_preamble_blocked', {
+        reason: blockReason,
+        toolName,
+        text: this.clip(preamble, 500)
+      });
+      this.patchState(this.progressPatchForTool(toolName));
+      return;
+    }
+    this.toolPreambleSpoken = true;
+    this.reportLog('realtime_preamble_accepted', { toolName, text: preamble });
+    this.patchState({
+      displayHeader: this.clip(preamble, 48),
+      displayCaption: this.clip(preamble, 160),
+      summary: this.clip(preamble, 200),
+      response: ''
+    });
+    this.reportLog('realtime_preamble_tts_skipped', {
+      reason: 'avoid_local_tts_overlap_with_realtime_audio',
+      toolName
+    });
+  }
+
   private reportLog(type: string, details?: unknown): void {
     window.clicky.reportAgentLogEvent(this.options.agentId, type, details);
   }
@@ -635,17 +730,6 @@ export class RealtimeAgentSession {
     };
   }
 
-  private speakDeterministicAcknowledgement(transcript: string): void {
-    const acknowledgement = acknowledgementForTranscript(transcript);
-    if (!acknowledgement) return;
-    this.reportLog('realtime_deterministic_acknowledgement', { text: acknowledgement });
-    void window.clicky.speak(acknowledgement, this.options.agentId).catch((error) => {
-      this.reportLog('realtime_deterministic_acknowledgement_tts_error', {
-        error: error instanceof Error ? error.message : String(error)
-      });
-    });
-  }
-
   private clip(text: string, max: number): string {
     const clean = text.replace(/\s+/g, ' ').trim();
     return clean.length <= max ? clean : `${clean.slice(0, Math.max(0, max - 1)).trimEnd()}…`;
@@ -683,23 +767,57 @@ function shouldForceFileCleanupToolCall(transcript: string): boolean {
     && /\b(file|files|docx|xlsx|pdf|document|spreadsheet|excel|desktop|home screen)\b/i.test(transcript);
 }
 
-function acknowledgementForTranscript(transcript: string): string {
-  if (shouldForceEmailToolCall(transcript)) {
-    return 'Checking your email now.';
+function isResponseTextDelta(type: string | undefined): boolean {
+  return type === 'response.audio_transcript.delta'
+    || type === 'response.output_audio_transcript.delta'
+    || type === 'response.text.delta'
+    || type === 'response.output_text.delta';
+}
+
+function extractShortPreamble(text: string): string {
+  const clean = text.replace(/\s+/g, ' ').trim();
+  if (!clean) return '';
+  const firstSentence = clean.match(/^(.{1,220}?[.!?])(?:\s|$)/)?.[1]?.trim();
+  return firstSentence ?? (clean.length <= 180 ? clean : '');
+}
+
+function blockedPreambleReason(preamble: string, transcript: string, toolName: string): string | undefined {
+  const text = preamble.toLowerCase().replace(/[’‘]/g, "'");
+  const userText = transcript.toLowerCase();
+  const tool = toolName.toLowerCase();
+
+  if (/\b(i\s+(?:cannot|can't|can not|do not|don't|won't|am unable)|i'm unable|i am unable|i can only|you(?:'d| would)? need to|you can)\b/.test(text)) {
+    return 'refusal_or_manual_instruction';
   }
-  if (shouldForceFileCleanupToolCall(transcript)) {
-    return 'Moving those files to trash now.';
+  if (/\b(no access|without access|cannot access|can't access|not able to access|not directly access|not directly control|not directly move)\b/.test(text)) {
+    return 'false_capability_claim';
   }
-  if (/\b(open|visit|launch)\b.*\bhttps?:\/\/|\b(open|visit|launch)\b.*\b(site|website|link|url)\b/i.test(transcript)) {
-    return 'Opening that link now.';
+
+  if (tool === 'check_email' && !/\b(email|mail|inbox|message|messages)\b/.test(text)) {
+    return 'missing_email_action';
   }
-  if (/\b(scrape|read|summarize|summarise|fetch)\b.*\b(site|website|page|url|link)\b/i.test(transcript)) {
-    return 'Fetching that page now.';
+  if ((tool === 'execute_bash_command' || shouldForceFileCleanupToolCall(userText)) && shouldForceFileCleanupToolCall(userText)) {
+    if (/\b(try|you can|make|create|add|keep|sort|folder|folders|subfolder|subfolders|to review)\b/.test(text)) {
+      return 'manual_cleanup_suggestion';
+    }
+    if (!/\b(move|moving|clean|cleaning|declutter|organize|organise|trash|desktop|files?)\b/.test(text)) {
+      return 'missing_file_cleanup_action';
+    }
+    if (!/\b(i'll|i will|i'm|i am|moving|cleaning|decluttering|organizing|organising)\b/.test(text)) {
+      return 'not_action_preamble';
+    }
   }
-  if (/\b(write|create|save)\b.*\b(file|document|script|app|website)\b/i.test(transcript)) {
-    return 'Writing that file now.';
+  if (tool === 'write_file' && !/\b(write|writing|create|creating|build|building|save|saving|file|app|website|page)\b/.test(text)) {
+    return 'missing_write_action';
   }
-  return 'Running that now.';
+  if (tool === 'open_url' && !/\b(open|opening|launch|visit|link|url|website|site)\b/.test(text)) {
+    return 'missing_open_action';
+  }
+  if (tool === 'scrape_website' && !/\b(read|reading|fetch|fetching|summar|page|website|site)\b/.test(text)) {
+    return 'missing_scrape_action';
+  }
+
+  return undefined;
 }
 
 function buildFileCleanupFinalResponse(output: string): string {
@@ -729,10 +847,10 @@ function buildFileCleanupFinalResponse(output: string): string {
 function extractTranscriptFromDonePayload(payload: RealtimeEvent): string {
   const outputs = payload.response?.output ?? [];
   const transcripts = outputs
-    .filter((item) => item.type === 'message')
-    .flatMap((item) => item.content ?? [])
-    .filter((c) => c.type === 'output_audio' && c.transcript)
-    .map((c) => c.transcript as string);
+      .filter((item) => item.type === 'message')
+      .flatMap((item) => item.content ?? [])
+      .map((c) => c.transcript || c.text || '')
+      .filter(Boolean);
   return transcripts.join(' ').trim();
 }
 

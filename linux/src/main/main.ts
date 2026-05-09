@@ -2,12 +2,12 @@ import { app, BrowserWindow, desktopCapturer, globalShortcut, ipcMain, Menu, nat
 import { appendFile, mkdir, readFile, stat, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, extname, isAbsolute, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { exec, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { loadSettings, saveSettings } from './settings';
-import { WorkerApi } from './workerApi';
+import { buildOpenAIMessages, WorkerApi } from './workerApi';
 import { scrapeWebsite } from './scraper';
 import { ipcChannels } from '../shared/ipcChannels';
 import { buildTaskAcknowledgement, cleanAcknowledgementSpeech } from '../shared/acknowledgement';
@@ -53,6 +53,7 @@ let keepAliveTimer: NodeJS.Timeout | undefined;
 let cachedTranscribeToken: { value: Awaited<ReturnType<WorkerApi['getTranscribeToken']>>; fetchedAt: number } | undefined;
 let pendingTranscribeToken: Promise<TranscribeTokenResponse> | undefined;
 const agents = new Map<string, { window: BrowserWindow; state: AgentState; expanded: boolean }>();
+const ttsSequenceByAgent = new Map<string, number>();
 const windowContexts = new Map<number, WindowContext>();
 const agentWindowMetrics = {
   miniWidth: 52,
@@ -234,11 +235,18 @@ function speakWithOpenAiInBackground(api: WorkerApi, win: BrowserWindow, agentId
   void (async () => {
     const speechText = normalizeSpeechText(stripPointTagsForSpeech(text));
     if (!speechText) return;
+    const sequence = (ttsSequenceByAgent.get(agentId) ?? 0) + 1;
+    ttsSequenceByAgent.set(agentId, sequence);
     logAgentRunEvent(agentId, 'tts_request', { reason, text: trimLogText(speechText), chars: speechText.length });
 
     try {
       console.log('[clicky:agent] requesting OpenAI speech', { agentId, reason, chars: speechText.length });
       const audio = await api.synthesizeSpeech(speechText);
+      if (ttsSequenceByAgent.get(agentId) !== sequence) {
+        console.log('[clicky:agent] skipped stale speech audio', { agentId, reason, sequence });
+        logAgentRunEvent(agentId, 'tts_skipped_stale', { reason, sequence });
+        return;
+      }
       if (reason === 'acknowledgement' && agents.get(agentId)?.state.status !== 'running') {
         console.log('[clicky:agent] skipped stale acknowledgement speech', { agentId });
         logAgentRunEvent(agentId, 'tts_skipped_stale_acknowledgement');
@@ -261,6 +269,13 @@ function speakWithOpenAiInBackground(api: WorkerApi, win: BrowserWindow, agentId
       }
     }
   })();
+}
+
+function stopAgentSpeech(win: BrowserWindow, agentId: string, reason: string): void {
+  const sequence = (ttsSequenceByAgent.get(agentId) ?? 0) + 1;
+  ttsSequenceByAgent.set(agentId, sequence);
+  logAgentRunEvent(agentId, 'tts_stop', { reason, sequence });
+  safeSend(win, ipcChannels.ttsStop);
 }
 
 function waitForWindowLoad(win: BrowserWindow): Promise<void> {
@@ -709,6 +724,14 @@ function createErrorAgent(message: string): string {
   return agentId;
 }
 
+function createAgentWorkerApi(): WorkerApi {
+  const realApi = new WorkerApi({ workerBaseUrl: settings.workerBaseUrl });
+  if (isE2EMode() && process.env.CLICKY_REAL_E2E !== '1' && fakeWorkerApi) {
+    return fakeWorkerApi as unknown as WorkerApi;
+  }
+  return realApi;
+}
+
 async function transcribeWithWhisper(audio: RecordedAudioPayload): Promise<string> {
   console.log('[clicky:whisper] transcription requested', {
     bytes: audio.bytes.byteLength,
@@ -729,6 +752,11 @@ async function transcribeWithWhisper(audio: RecordedAudioPayload): Promise<strin
     const form = new FormData();
     form.append('model', 'gpt-4o-transcribe');
     form.append('file', new Blob([fileBytes], { type: audio.mimeType || 'audio/webm' }), `clicky${extension}`);
+    form.append('language', 'en');
+    form.append(
+      'prompt',
+      'Transcribe in English only. Do not translate into Urdu or output non-English script. If speech is unclear, choose the closest English words.'
+    );
 
     console.log('[clicky:whisper] sending audio to OpenAI transcription endpoint');
     const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
@@ -843,6 +871,227 @@ function unquoteEnvValue(value: string): string {
   return trimmed;
 }
 
+function shellSingleQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\"'\"'`)}'`;
+}
+
+function transcriptRequestsOpenAction(transcript: string): boolean {
+  const text = transcript.toLowerCase();
+  return /\b(open|launch|view)\b/.test(text);
+}
+
+function transcriptRequestsBuildAction(transcript: string): boolean {
+  const text = transcript.toLowerCase();
+  const buildVerb = /\b(build|make|create|generate|code|turn|convert|transform)\b/.test(text);
+  const target = /\b(site|website|web\s?page|landing\s?page|app|page)\b/.test(text);
+  const intoWebsite = /\b(?:turn|convert|transform)\b[\s\S]{0,80}\b(?:into|to)\b[\s\S]{0,80}\b(?:a\s+)?(?:site|website|web\s?page|landing\s?page|app|page)\b/.test(text);
+  return (buildVerb && target) || intoWebsite;
+}
+
+function inferOpenLastDownloadedCommand(transcript: string, lastDownloadedPath: string | undefined): string | undefined {
+  if (!lastDownloadedPath) return undefined;
+  if (!transcriptRequestsOpenAction(transcript)) return undefined;
+  return `xdg-open ${shellSingleQuote(lastDownloadedPath)}`;
+}
+
+function buildOpenFileCommand(filePath: string): string {
+  return `xdg-open ${shellSingleQuote(filePath)} >/dev/null 2>&1 &`;
+}
+
+function inferOpenGeneratedAppCommand(transcript: string, generatedAppPath: string | undefined): string | undefined {
+  if (!generatedAppPath) return undefined;
+  if (!transcriptRequestsOpenAction(transcript) && !transcriptRequestsBuildAction(transcript)) return undefined;
+  const fileUrl = pathToFileURL(generatedAppPath).toString();
+  return `if command -v google-chrome >/dev/null 2>&1; then google-chrome --new-tab ${shellSingleQuote(fileUrl)} >/dev/null 2>&1 & elif command -v google-chrome-stable >/dev/null 2>&1; then google-chrome-stable --new-tab ${shellSingleQuote(fileUrl)} >/dev/null 2>&1 & elif command -v chromium >/dev/null 2>&1; then chromium --new-tab ${shellSingleQuote(fileUrl)} >/dev/null 2>&1 & else xdg-open ${shellSingleQuote(fileUrl)} >/dev/null 2>&1 & fi`;
+}
+
+function isOpenLikeShellCommand(command: string): boolean {
+  return /\b(xdg-open|google-chrome|google-chrome-stable|chromium)\b/.test(command);
+}
+
+function transcriptRequestsDesktopCleanup(transcript: string): boolean {
+  return /\b(desktop|home screen|docx|xlsx|pdf|document|spreadsheet|excel|word|clean|cleanup|declutter|tidy|remove|get rid|delete|move|trash)\b/i.test(transcript)
+    && /\b(file|files|docx|xlsx|pdf|document|spreadsheet|excel|word|desktop|home screen)\b/i.test(transcript);
+}
+
+function buildDesktopCleanupCommand(): string {
+  return [
+    'set -e',
+    'target="$HOME/Desktop"',
+    'if [ ! -d "$target" ]; then',
+    '  target="$HOME"',
+    'fi',
+    'matches=( -iname "*.doc" -o -iname "*.docx" -o -iname "*.xls" -o -iname "*.xlsx" -o -iname "*.pdf" )',
+    'before=$(find "$target" -maxdepth 1 -type f \\( "${matches[@]}" \\) | wc -l)',
+    'if command -v gio >/dev/null 2>&1; then',
+    '  find "$target" -maxdepth 1 -type f \\( "${matches[@]}" \\) -print0 | xargs -0 -r gio trash',
+    'else',
+    '  trash="$HOME/.local/share/Trash/files"',
+    '  mkdir -p "$trash"',
+    '  while IFS= read -r -d "" f; do',
+    '    mv -n "$f" "$trash/"',
+    '  done < <(find "$target" -maxdepth 1 -type f \\( "${matches[@]}" \\) -print0)',
+    'fi',
+    'after=$(find "$target" -maxdepth 1 -type f \\( "${matches[@]}" \\) | wc -l)',
+    'echo "Target: $target"',
+    'echo "Matching files before: $before"',
+    'echo "Matching files remaining: $after"',
+    'echo "Moved to trash: $((before - after))"'
+  ].join('\n');
+}
+
+function isTerminalLocalActionCommand(command: string): boolean {
+  return isOpenLikeShellCommand(command) ||
+    /\b(gio\s+trash|trash-put|mv|cp|mkdir|touch|chmod|chown|rm|rmdir|ln)\b/i.test(command);
+}
+
+function ensureSentence(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return trimmed;
+  return /[.!?]$/.test(trimmed) ? trimmed : `${trimmed}.`;
+}
+
+function formatTerminalLocalActionCompletion(command: string, result: ShellResult): string {
+  if (isOpenLikeShellCommand(command) && !result.stdout.trim() && !result.stderr.trim()) {
+    return 'Opened it.';
+  }
+
+  const stdoutLines = result.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const stderrLines = result.stderr.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const lastUsefulLine = stdoutLines.at(-1) ?? stderrLines.at(-1);
+  if (lastUsefulLine) {
+    return `Done. ${ensureSentence(lastUsefulLine.slice(0, 160))}`;
+  }
+
+  return 'Done.';
+}
+
+function extractAbsolutePathFromText(text: string): string | undefined {
+  const match = text.match(/\/[^\s"'`]+/);
+  return match?.[0]?.replace(/[.,;:!?]+$/, '');
+}
+
+function decodeXmlEntities(value: string): string {
+  return value
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#x([0-9a-f]+);/gi, (_match, hex) => String.fromCodePoint(Number.parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_match, dec) => String.fromCodePoint(Number.parseInt(dec, 10)));
+}
+
+function docxXmlToText(xml: string): string {
+  return decodeXmlEntities(xml
+    .replace(/<w:tab\/>/g, '\t')
+    .replace(/<\/w:p>/g, '\n')
+    .replace(/<\/w:tr>/g, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim());
+}
+
+async function readDownloadedDocumentText(filePath: string): Promise<string> {
+  const extension = extname(filePath).toLowerCase();
+  if (extension === '.txt' || extension === '.md' || extension === '.csv' || extension === '.html') {
+    return readFile(filePath, 'utf8');
+  }
+  if (extension === '.docx') {
+    const { stdout } = await execFileAsync('unzip', ['-p', filePath, 'word/document.xml'], { maxBuffer: 10 * 1024 * 1024 });
+    return docxXmlToText(stdout);
+  }
+  throw new Error(`Reading ${extension || 'this file type'} is not supported yet.`);
+}
+
+function htmlEscape(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function slugFromText(value: string, fallback: string): string {
+  const slug = value.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 42);
+  return slug || fallback;
+}
+
+function buildFallbackWebsiteHtml(sourceText: string, transcript: string): string {
+  const normalized = sourceText.replace(/\s+/g, ' ').trim();
+  const lower = `${normalized} ${transcript}`.toLowerCase();
+  const title = lower.includes('coffee') ? 'Coffee Shop Landing Page' : 'Generated Landing Page';
+  const subtitle = normalized
+    ? normalized.slice(0, 220)
+    : 'A focused, polished landing page generated from your request.';
+  const featureSource = normalized
+    ? normalized.split(/(?<=[.!?])\s+/).filter(Boolean).slice(0, 3)
+    : ['Fast-loading single page design', 'Responsive layout for mobile and desktop', 'Clear call to action'];
+  const features = featureSource.length >= 3 ? featureSource : [...featureSource, 'Responsive layout', 'Clear call to action'].slice(0, 3);
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${htmlEscape(title)}</title>
+  <style>
+    :root { color-scheme: light; --ink: #231a12; --cream: #fff7e8; --coffee: #6f432a; --accent: #d98c38; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: Georgia, 'Times New Roman', serif; color: var(--ink); background: radial-gradient(circle at top left, #ffe0a8, transparent 32rem), var(--cream); }
+    main { min-height: 100vh; display: grid; place-items: center; padding: 48px 20px; }
+    .card { width: min(1080px, 100%); border: 1px solid rgba(111,67,42,.25); border-radius: 34px; overflow: hidden; background: rgba(255,255,255,.72); box-shadow: 0 24px 80px rgba(74, 44, 24, .18); }
+    .hero { display: grid; grid-template-columns: 1.1fr .9fr; gap: 28px; padding: clamp(32px, 6vw, 76px); align-items: center; }
+    .eyebrow { letter-spacing: .18em; text-transform: uppercase; color: var(--accent); font: 700 12px ui-sans-serif, system-ui; }
+    h1 { font-size: clamp(44px, 8vw, 92px); line-height: .9; margin: 12px 0 22px; }
+    p { font-size: clamp(18px, 2vw, 23px); line-height: 1.55; margin: 0 0 28px; }
+    .cta { display: inline-flex; align-items: center; padding: 15px 22px; border-radius: 999px; background: var(--coffee); color: white; text-decoration: none; font: 800 15px ui-sans-serif, system-ui; }
+    .visual { min-height: 420px; border-radius: 28px; background: linear-gradient(145deg, #8a5130, #2c170d); position: relative; overflow: hidden; }
+    .visual:before { content: ""; position: absolute; width: 220px; height: 220px; border-radius: 50%; background: #f5c16f; left: 50%; top: 20%; transform: translateX(-50%); box-shadow: 0 80px 0 16px rgba(255,255,255,.16); }
+    .visual:after { content: "Fresh Daily"; position: absolute; left: 28px; bottom: 28px; color: white; font-size: 46px; font-weight: 800; }
+    .features { display: grid; grid-template-columns: repeat(3, 1fr); border-top: 1px solid rgba(111,67,42,.18); }
+    .feature { padding: 28px; font: 600 16px ui-sans-serif, system-ui; }
+    @media (max-width: 760px) { .hero, .features { grid-template-columns: 1fr; } .visual { min-height: 280px; } }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="card">
+      <div class="hero">
+        <div>
+          <div class="eyebrow">Built by Clicky</div>
+          <h1>${htmlEscape(title)}</h1>
+          <p>${htmlEscape(subtitle)}</p>
+          <a class="cta" href="#menu">Explore the concept</a>
+        </div>
+        <div class="visual" aria-label="Warm coffee shop hero artwork"></div>
+      </div>
+      <div id="menu" class="features">
+        ${features.map((feature) => `<div class="feature">${htmlEscape(feature)}</div>`).join('\n        ')}
+      </div>
+    </section>
+  </main>
+</body>
+</html>
+`;
+}
+
+async function buildFallbackGeneratedSite(state: AgentState, transcript: string): Promise<{ filePath: string; content: string; sourceText: string }> {
+  let sourceText = '';
+  if (state.lastDownloadedPath) {
+    sourceText = await readDownloadedDocumentText(state.lastDownloadedPath).catch(() => '');
+  }
+  const slug = slugFromText(sourceText || transcript, 'generated-site');
+  const filePath = join(CLICKY_APPS_DIR, slug, 'index.html');
+  return {
+    filePath,
+    content: buildFallbackWebsiteHtml(sourceText, transcript),
+    sourceText
+  };
+}
+
 function extensionForMimeType(mimeType: string): string {
   if (mimeType.includes('wav')) return '.wav';
   if (mimeType.includes('mpeg') || mimeType.includes('mp3')) return '.mp3';
@@ -851,7 +1100,12 @@ function extensionForMimeType(mimeType: string): string {
 }
 
 async function executeRealtimeToolRequest(request: RealtimeToolRequest): Promise<RealtimeToolResponse> {
-  const args = request.arguments ? JSON.parse(request.arguments) as Record<string, unknown> : {};
+  let args: Record<string, unknown> = {};
+  try {
+    args = request.arguments ? JSON.parse(request.arguments) as Record<string, unknown> : {};
+  } catch {
+    args = {};
+  }
   const agentEntry = request.agentId ? agents.get(request.agentId) : undefined;
   const agentId = request.agentId ?? 'unknown-agent';
   logAgentRunEvent(agentId, 'realtime_tool_call', {
@@ -866,6 +1120,13 @@ async function executeRealtimeToolRequest(request: RealtimeToolRequest): Promise
       safeSend(agentEntry.window, ipcChannels.agentCommandFlash, label);
       safeSend(agentEntry.window, ipcChannels.agentUpdate, agentEntry.state);
     }
+  };
+  const shellProgressLabel = (command: string): string => {
+    if (isOpenLikeShellCommand(command)) return 'Opening file...';
+    if (/\b(npm|pnpm|yarn)\s+(run\s+)?(build|dev|start|test)\b/i.test(command)) return 'Running project task...';
+    if (/\b(python3?|node)\b/i.test(command)) return 'Running local script...';
+    if (/\b(mkdir|cp|mv|rm|gio\s+trash|find)\b/i.test(command)) return 'Updating local files...';
+    return 'Working locally...';
   };
 
   if (request.name === 'check_email') {
@@ -909,17 +1170,36 @@ async function executeRealtimeToolRequest(request: RealtimeToolRequest): Promise
   }
 
   if (request.name === 'execute_bash_command') {
-    const command = typeof args.command === 'string' ? args.command : '';
+    let command = typeof args.command === 'string' ? args.command : '';
+    const isDesktopCleanup = !!agentEntry && transcriptRequestsDesktopCleanup(agentEntry.state.transcript);
+    if (isDesktopCleanup) {
+      if (command !== buildDesktopCleanupCommand()) {
+        logAgentRunEvent(agentId, 'tool_arguments_repaired', {
+          name: request.name,
+          reason: 'force_desktop_only_cleanup_command',
+          originalCommand: trimLogText(command)
+        });
+      }
+      command = buildDesktopCleanupCommand();
+    }
+    if (!command && agentEntry) {
+      const inferred = inferOpenGeneratedAppCommand(agentEntry.state.transcript, agentEntry.state.generatedAppPath) ??
+        inferOpenLastDownloadedCommand(agentEntry.state.transcript, agentEntry.state.lastDownloadedPath);
+      if (inferred) {
+        command = inferred;
+      }
+    }
     if (!command) {
       logAgentRunEvent(agentId, 'realtime_tool_result', {
         name: request.name,
         ok: false,
         error: 'Missing command'
       });
-      return { output: 'Shell command failed: missing command.' };
+      return { output: 'Shell command failed: missing command.', kind: 'failed' };
     }
 
-    flash(command);
+    const progressLabel = shellProgressLabel(command);
+    flash(progressLabel);
     const result = await executeShellCommand(command);
     logAgentRunEvent(agentId, 'realtime_tool_result', {
       name: request.name,
@@ -929,15 +1209,40 @@ async function executeRealtimeToolRequest(request: RealtimeToolRequest): Promise
       stderr: trimLogText(result.stderr),
       error: result.error
     });
+    const terminalLocalAction = !result.error && isTerminalLocalActionCommand(command);
+    if (terminalLocalAction) {
+      const userMessage = formatTerminalLocalActionCompletion(command, result);
+      return {
+        commandLabel: progressLabel,
+        output: `Command executed.\nSTDOUT:\n${result.stdout}\nSTDERR:\n${result.stderr}`.trim(),
+        kind: 'sideEffectOnly',
+        done: true,
+        userMessage
+      };
+    }
     return {
-      commandLabel: command,
-      output: `Command executed.\nSTDOUT:\n${result.stdout}\nSTDERR:\n${result.stderr}${result.error ? `\nERROR:\n${result.error}` : ''}`.trim()
+      commandLabel: progressLabel,
+      output: `Command executed.\nSTDOUT:\n${result.stdout}\nSTDERR:\n${result.stderr}${result.error ? `\nERROR:\n${result.error}` : ''}`.trim(),
+      kind: result.error ? 'failed' : 'contentBearing',
+      done: false
     };
   }
 
   if (request.name === 'write_file') {
-    const filePath = typeof args.file_path === 'string' ? args.file_path : '';
-    const content = typeof args.content === 'string' ? args.content : undefined;
+    let filePath = typeof args.file_path === 'string' ? args.file_path : '';
+    let content = typeof args.content === 'string' ? args.content : undefined;
+    const repairedGeneratedSite = !filePath && content === undefined && agentEntry && transcriptRequestsBuildAction(agentEntry.state.transcript);
+    if (repairedGeneratedSite && agentEntry) {
+      const generated = await buildFallbackGeneratedSite(agentEntry.state, agentEntry.state.transcript);
+      filePath = generated.filePath;
+      content = generated.content;
+      logAgentRunEvent(agentId, 'tool_arguments_repaired', {
+        name: request.name,
+        reason: 'missing_write_file_arguments_for_build_request',
+        filePath,
+        sourceChars: generated.sourceText.length
+      });
+    }
     if (!filePath || content === undefined) {
       logAgentRunEvent(agentId, 'realtime_tool_result', {
         name: request.name,
@@ -947,16 +1252,48 @@ async function executeRealtimeToolRequest(request: RealtimeToolRequest): Promise
       return { output: 'File write failed: missing file_path or content.' };
     }
 
-    flash(`Writing ${filePath}`);
+    const progressLabel = 'Creating local files...';
+    flash(progressLabel);
     try {
       const writtenPath = await writeGeneratedFile(filePath, content);
+      if (agentEntry) {
+        agentEntry.state.generatedAppPath = writtenPath;
+        persistAgentStateSnapshot(agentEntry.state, 'generated-app-written');
+      }
+      let autoOpenNote = '';
+      if (agentEntry) {
+        const openCommand = inferOpenGeneratedAppCommand(agentEntry.state.transcript, writtenPath);
+        if (openCommand) {
+          flash('Opening generated website in browser');
+          const openResult = await executeShellCommand(openCommand);
+          logAgentRunEvent(agentId, 'realtime_tool_result', {
+            name: 'execute_bash_command',
+            ok: !openResult.error,
+            command: openCommand,
+            stdout: trimLogText(openResult.stdout),
+            stderr: trimLogText(openResult.stderr),
+            error: openResult.error,
+            source: 'auto_open_generated_app'
+          });
+          autoOpenNote = openResult.error
+            ? ` I tried to open it, but opening failed: ${openResult.error}`
+            : ' I also opened it in a browser tab.';
+        }
+      }
       logAgentRunEvent(agentId, 'realtime_tool_result', {
         name: request.name,
         ok: true,
         path: writtenPath,
-        chars: content.length
+        chars: content.length,
+        repaired: repairedGeneratedSite
       });
-      return { commandLabel: `Writing ${filePath}`, output: `File written successfully: ${writtenPath}` };
+      return {
+        commandLabel: progressLabel,
+        output: `File written successfully: ${writtenPath}.${autoOpenNote}`,
+        kind: autoOpenNote.includes('I also opened') ? 'sideEffectOnly' : 'contentBearing',
+        done: autoOpenNote.includes('I also opened'),
+        userMessage: autoOpenNote.includes('I also opened') ? 'Built it and opened it in a browser tab.' : undefined
+      };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       logAgentRunEvent(agentId, 'realtime_tool_result', {
@@ -965,24 +1302,102 @@ async function executeRealtimeToolRequest(request: RealtimeToolRequest): Promise
         path: filePath,
         error: message
       });
-      return { commandLabel: `Writing ${filePath}`, output: `File write failed: ${message}` };
+      return { commandLabel: progressLabel, output: `File write failed: ${message}`, kind: 'failed' };
+    }
+  }
+
+  if (request.name === 'read_file') {
+    const requestedPath = typeof args.path === 'string' ? args.path : '';
+    const maxChars = typeof args.max_chars === 'number' ? Math.max(1000, Math.min(args.max_chars, 50000)) : 12000;
+    const filePath = requestedPath || extractAbsolutePathFromText(agentEntry?.state.transcript ?? '') || agentEntry?.state.lastDownloadedPath || '';
+    if (!filePath) {
+      logAgentRunEvent(agentId, 'realtime_tool_result', {
+        name: request.name,
+        ok: false,
+        error: 'Missing path'
+      });
+      return { output: 'File read failed: missing path and no last downloaded file is available.', kind: 'failed' };
+    }
+    const progressLabel = 'Reading file...';
+    flash(progressLabel);
+    try {
+      const text = (await readDownloadedDocumentText(filePath)).slice(0, maxChars);
+      logAgentRunEvent(agentId, 'realtime_tool_result', {
+        name: request.name,
+        ok: true,
+        path: filePath,
+        chars: text.length
+      });
+      return {
+        commandLabel: progressLabel,
+        output: text ? `File: ${filePath}\n\n${text}` : `File ${filePath} was readable but contained no text.`
+      };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logAgentRunEvent(agentId, 'realtime_tool_result', {
+        name: request.name,
+        ok: false,
+        path: filePath,
+        error: message
+      });
+      return { commandLabel: progressLabel, output: `File read failed: ${message}`, kind: 'failed' };
+    }
+  }
+
+  if (request.name === 'open_file') {
+    const requestedPath = typeof args.path === 'string' ? args.path : '';
+    const filePath = requestedPath || extractAbsolutePathFromText(agentEntry?.state.transcript ?? '') || agentEntry?.state.lastDownloadedPath || '';
+    if (!filePath) {
+      logAgentRunEvent(agentId, 'realtime_tool_result', {
+        name: request.name,
+        ok: false,
+        error: 'Missing path'
+      });
+      return { output: 'Open file failed: missing path and no last downloaded file is available.', kind: 'failed' };
+    }
+    const progressLabel = 'Opening file...';
+    flash(progressLabel);
+    try {
+      if (!isE2EMode()) {
+        const openResult = await executeShellCommand(buildOpenFileCommand(filePath));
+        if (openResult.error) throw new Error(openResult.error);
+      }
+      logAgentRunEvent(agentId, 'realtime_tool_result', { name: request.name, ok: true, path: filePath });
+      return {
+        commandLabel: progressLabel,
+        output: `Opened file: ${filePath}`,
+        kind: 'sideEffectOnly',
+        done: true,
+        userMessage: 'Opened it.'
+      };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logAgentRunEvent(agentId, 'realtime_tool_result', { name: request.name, ok: false, path: filePath, error: message });
+      return { commandLabel: progressLabel, output: `Open file failed: ${message}`, kind: 'failed' };
     }
   }
 
   if (request.name === 'open_url') {
     const url = typeof args.url === 'string' ? args.url : '';
     if (!url) {
-      return { output: 'Open URL failed: missing url.' };
+      return { output: 'Open URL failed: missing url.', kind: 'failed' };
     }
-    flash(`Opening ${url} in browser...`);
+    const progressLabel = 'Opening link...';
+    flash(progressLabel);
     try {
       await shell.openExternal(url);
       logAgentRunEvent(agentId, 'realtime_tool_result', { name: request.name, ok: true, url });
-      return { commandLabel: `Opening ${url} in browser...`, output: 'The link has been opened in the default browser.' };
+      return {
+        commandLabel: progressLabel,
+        output: 'The link has been opened in the default browser.',
+        kind: 'sideEffectOnly',
+        done: true,
+        userMessage: 'Opened the link.'
+      };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       logAgentRunEvent(agentId, 'realtime_tool_result', { name: request.name, ok: false, url, error: message });
-      return { commandLabel: `Opening ${url} in browser...`, output: `Open URL failed: ${message}` };
+      return { commandLabel: progressLabel, output: `Open URL failed: ${message}`, kind: 'failed' };
     }
   }
 
@@ -991,7 +1406,8 @@ async function executeRealtimeToolRequest(request: RealtimeToolRequest): Promise
     if (!url) {
       return { output: 'Website scrape failed: missing url.' };
     }
-    flash(`Scraping ${url}...`);
+    const progressLabel = 'Reading website...';
+    flash(progressLabel);
     try {
       const result = await scrapeWebsite({
         url,
@@ -1006,11 +1422,129 @@ async function executeRealtimeToolRequest(request: RealtimeToolRequest): Promise
         extractor: result.extractor,
         textChars: result.text.length
       });
-      return { commandLabel: `Scraping ${url}...`, output: `${prefix}${result.text}` };
+      return { commandLabel: progressLabel, output: `${prefix}${result.text}` };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       logAgentRunEvent(agentId, 'realtime_tool_result', { name: request.name, ok: false, url, error: message });
-      return { commandLabel: `Scraping ${url}...`, output: `Website scrape failed: ${message}` };
+      return { commandLabel: progressLabel, output: `Website scrape failed: ${message}` };
+    }
+  }
+
+  if (request.name === 'download_email_attachment') {
+    let emailNumber = typeof args.email_number === 'number' ? args.email_number : undefined;
+    let filename = typeof args.filename === 'string' ? args.filename.trim() : undefined;
+    const emailConfig = settings.email ?? { enabled: false, provider: 'gmail', username: '', password: '' };
+
+    let emails = agentEntry?.state.emails ?? [];
+    if (emails.length === 0) {
+      try {
+        const { fetchRecentEmails } = await import('./emailService');
+        emails = await withTimeout(fetchRecentEmails(emailConfig, 5), 12_000, 'Email check timed out');
+        if (agentEntry) {
+          agentEntry.state.emails = emails;
+          persistAgentStateSnapshot(agentEntry.state, 'realtime-email-fetched-for-attachment');
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        logAgentRunEvent(agentId, 'realtime_tool_result', {
+          name: request.name,
+          ok: false,
+          error: `Failed to fetch recent emails for attachment lookup: ${message}`
+        });
+        return {
+          commandLabel: 'Fetching recent emails...',
+          output: `I could not fetch recent emails to resolve the attachment. Error: ${message}`,
+          kind: 'failed'
+        };
+      }
+    }
+
+    let email = emailNumber && emailNumber > 0 && emailNumber <= emails.length ? emails[emailNumber - 1] : undefined;
+    if (!email && emails.length > 0) {
+      emailNumber = 1;
+      email = emails[0];
+    }
+    if (!filename && email) {
+      const mentioned = email.attachments.find((name) => {
+        const normalizedName = name.toLowerCase();
+        const normalizedTranscript = (agentEntry?.state.transcript ?? '').toLowerCase();
+        return normalizedName.length > 0 && normalizedTranscript.includes(normalizedName);
+      });
+      filename = mentioned ?? (email.attachments.length === 1 ? email.attachments[0] : undefined);
+    }
+    if (!email || !filename) {
+      const latestAttachmentHelp = emails[0]?.attachments?.length
+        ? `Latest email attachments: ${emails[0].attachments.join(', ')}`
+        : 'The latest email has no attachments.';
+      logAgentRunEvent(agentId, 'realtime_tool_result', {
+        name: request.name,
+        ok: false,
+        error: 'Missing required arguments: email_number and filename',
+        knownEmails: emails.length
+      });
+      return {
+        output: `I need the email number and exact attachment filename to download it. ${latestAttachmentHelp}`,
+        kind: 'failed'
+      };
+    }
+
+    const progressLabel = 'Downloading attachment...';
+    flash(progressLabel);
+    try {
+      const { downloadAttachment } = await import('./emailService');
+      const destPath = await ensureUniquePath(app.getPath('downloads'), filename);
+      await downloadAttachment(emailConfig, email.uid, filename, destPath);
+      if (agentEntry) {
+        agentEntry.state.lastDownloadedPath = destPath;
+        persistAgentStateSnapshot(agentEntry.state, 'realtime-attachment-downloaded');
+      }
+      let autoOpenNote = '';
+      const autoOpenCommand = inferOpenLastDownloadedCommand(agentEntry?.state.transcript ?? '', destPath);
+      if (autoOpenCommand) {
+        flash('Opening file...');
+        const openResult = await executeShellCommand(autoOpenCommand);
+        logAgentRunEvent(agentId, 'realtime_tool_result', {
+          name: 'execute_bash_command',
+          ok: !openResult.error,
+          command: autoOpenCommand,
+          stdout: trimLogText(openResult.stdout),
+          stderr: trimLogText(openResult.stderr),
+          error: openResult.error,
+          source: 'auto_open_downloaded_attachment'
+        });
+        autoOpenNote = openResult.error
+          ? ` I tried to open it, but opening failed: ${openResult.error}`
+          : ' I also opened it for you.';
+      }
+      logAgentRunEvent(agentId, 'realtime_tool_result', {
+        name: request.name,
+        ok: true,
+        uid: email.uid,
+        filename,
+        destPath,
+        resolvedEmailNumber: emailNumber
+      });
+      return {
+        commandLabel: progressLabel,
+        output: `The attachment "${filename}" has been downloaded to ${destPath}.${autoOpenNote}`,
+        kind: autoOpenNote.includes('I also opened') ? 'sideEffectOnly' : 'contentBearing',
+        done: autoOpenNote.includes('I also opened'),
+        userMessage: autoOpenNote.includes('I also opened') ? 'Downloaded and opened it.' : undefined
+      };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logAgentRunEvent(agentId, 'realtime_tool_result', {
+        name: request.name,
+        ok: false,
+        uid: email.uid,
+        filename,
+        error: message
+      });
+      return {
+        commandLabel: progressLabel,
+        output: `I was unable to download attachment "${filename}". Error: ${message}`,
+        kind: 'failed'
+      };
     }
   }
 
@@ -1019,7 +1553,7 @@ async function executeRealtimeToolRequest(request: RealtimeToolRequest): Promise
     ok: false,
     error: 'Unknown tool'
   });
-  return { output: `Unknown tool: ${request.name}` };
+  return { output: `Unknown tool: ${request.name}`, kind: 'failed' };
 }
 
 function splitEnvList(value: string | undefined): string[] {
@@ -1142,11 +1676,16 @@ function formatGSettingsStringList(paths: string[]): string {
 }
 
 async function executeShellCommand(command: string): Promise<ShellResult> {
+  const timeoutMs = 20_000;
   try {
-    const { stdout, stderr } = await execAsync(command, { shell: '/bin/bash' });
+    const { stdout, stderr } = await execAsync(command, { shell: '/bin/bash', timeout: timeoutMs });
     return { stdout: stdout.trim(), stderr: stderr.trim(), error: null };
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+    let message = err instanceof Error ? err.message : String(err);
+    const timeoutLike = typeof err === 'object' && err !== null && 'killed' in err && !!(err as { killed?: boolean }).killed;
+    if (timeoutLike || /timed out/i.test(message)) {
+      message = `Command timed out after ${timeoutMs}ms`;
+    }
     const stdout = (err as { stdout?: string }).stdout ?? '';
     const stderr = (err as { stderr?: string }).stderr ?? '';
     return { stdout: stdout.trim(), stderr: stderr.trim(), error: message };
@@ -1169,6 +1708,197 @@ async function writeGeneratedFile(filePath: string, content: string): Promise<st
   return resolvedPath;
 }
 
+type OpenAIMessage = Record<string, unknown>;
+
+type AgentToolCall = {
+  id: string;
+  name: string;
+  arguments: string;
+};
+
+const MAX_AGENT_TOOL_STEPS = 8;
+
+function buildRuntimeContextMessage(request: VoiceTurnRequest, state: AgentState): OpenAIMessage {
+  const recentEmailContext = (state.emails ?? []).slice(0, 5).map((email, index) => {
+    const attachments = email.attachments.length ? ` attachments: ${email.attachments.join(', ')}` : '';
+    return `Email #${index + 1}: from ${email.from}; subject ${email.subject};${attachments}`;
+  }).join('\n');
+
+  const screenContext = request.captures.length > 0
+    ? `Screen captures attached: ${request.captures.map((capture) => `${capture.label} ${capture.width}x${capture.height}`).join(', ')}`
+    : 'Screen captures attached: none. The app could not provide visual screen context for this turn; do not claim you can see the screen unless an image is attached.';
+
+  return {
+    role: 'system',
+    content:
+      'RUNTIME STATE FOR THIS TURN:\n' +
+      `${screenContext}\n` +
+      `Last downloaded file: ${state.lastDownloadedPath ?? 'none'}\n` +
+      `Last generated app/site file: ${state.generatedAppPath ?? 'none'}\n` +
+      `Recent email cache:\n${recentEmailContext || 'none'}\n` +
+      'Use tools dynamically. If a previous tool call failed because required arguments were missing, repair the call with concrete arguments from this runtime state or explain the limitation in the final answer.'
+  };
+}
+
+function buildInitialAgentMessages(request: VoiceTurnRequest, state: AgentState): OpenAIMessage[] {
+  const messages = buildOpenAIMessages(request) as OpenAIMessage[];
+  messages.splice(1, 0, buildRuntimeContextMessage(request, state));
+  return messages;
+}
+
+function appendAssistantToolCallMessage(messages: OpenAIMessage[], content: string, toolCalls: AgentToolCall[]): void {
+  messages.push({
+    role: 'assistant',
+    content: content.trim() ? content : null,
+    tool_calls: toolCalls.map((call) => ({
+      id: call.id,
+      type: 'function',
+      function: {
+        name: call.name,
+        arguments: call.arguments || '{}'
+      }
+    }))
+  });
+}
+
+function appendToolResultMessage(messages: OpenAIMessage[], toolCallId: string, output: string): void {
+  messages.push({
+    role: 'tool',
+    tool_call_id: toolCallId,
+    content: output
+  });
+}
+
+function updateAgentConversationHistory(state: AgentState, request: VoiceTurnRequest, assistantContent: string): void {
+  state.conversationHistory = [
+    ...request.conversationHistory,
+    { role: 'user', content: request.transcript },
+    { role: 'assistant', content: assistantContent }
+  ];
+}
+
+function finishAgentStream(
+  api: WorkerApi,
+  win: BrowserWindow,
+  state: AgentState,
+  request: VoiceTurnRequest,
+  agentId: string,
+  fullResponse: string,
+  stats: { chunkCount: number; streamedChars: number; commands: string[] },
+  reason: string
+): void {
+  state.status = 'done';
+  const split = splitAgentReply(fullResponse);
+  state.response = split.spokenText;
+
+  const emailDisplaySummary = Array.isArray(state.emails) && state.emails.length > 0 && /email|inbox|mail/i.test(request.transcript)
+    ? buildRecentEmailDisplaySummary(state.emails)
+    : undefined;
+  if (emailDisplaySummary && !split.displayHeader.trim() && !split.displayCaption.trim()) {
+    state.displayHeader = emailDisplaySummary.header;
+    state.displayCaption = emailDisplaySummary.caption;
+    state.displayDetails = emailDisplaySummary.details;
+  } else {
+    const llmDisplaySummary = compactDisplaySummary({
+      header: split.displayHeader || split.displayCaption || split.spokenText,
+      caption: split.displayCaption || split.displayHeader || split.spokenText
+    });
+    if (split.displayCaption.trim()) {
+      state.displayCaption = llmDisplaySummary.caption;
+    }
+    if (split.displayHeader.trim()) {
+      state.displayHeader = llmDisplaySummary.header;
+    }
+    state.displayDetails = undefined;
+  }
+
+  const caption = split.displayCaption.trim();
+  const headerLine = split.displayHeader.trim();
+  const spokenTrim = split.spokenText.trim();
+  const clipped = (t: string) => t.slice(0, 200) + (t.length > 200 ? '...' : '');
+  state.summary = caption ? clipped(caption) : headerLine ? clipped(headerLine) : clipped(spokenTrim);
+  state.completedAt = Date.now();
+  state.actions = [];
+  updateAgentConversationHistory(state, request, split.spokenText);
+
+  console.log('[clicky:agent] stream done', {
+    agentId,
+    reason,
+    responseChars: fullResponse.length,
+    spokenChars: split.spokenText.length,
+    headerChars: split.displayHeader.length,
+    captionChars: split.displayCaption.length,
+    chunks: stats.chunkCount,
+    streamedChars: stats.streamedChars,
+    commands: state.commands.length
+  });
+  logAgentRunEvent(agentId, 'stream_done', {
+    reason,
+    response: trimLogText(fullResponse),
+    spokenText: trimLogText(split.spokenText),
+    displayHeader: split.displayHeader,
+    displayCaption: split.displayCaption,
+    chunks: stats.chunkCount,
+    streamedChars: stats.streamedChars,
+    commands: stats.commands
+  });
+  persistAgentStateSnapshot(state, 'stream-done');
+  stopAgentSpeech(win, agentId, reason);
+  safeSend(win, ipcChannels.chatDone);
+  safeSend(win, ipcChannels.agentUpdate, state);
+  if (split.spokenText) {
+    speakWithOpenAiInBackground(api, win, agentId, split.spokenText, 'response');
+  }
+}
+
+function formatLocalToolCompletion(message: string): string {
+  return `<<<HEADER>>>\nDone\n<<<UI>>>\n${message}\n<<<SPOKEN>>>\n${message}`;
+}
+
+async function collectModelStep(
+  api: WorkerApi,
+  model: string,
+  messages: OpenAIMessage[],
+  win: BrowserWindow,
+  state: AgentState,
+  agentId: string,
+  stats: { chunkCount: number; streamedChars: number }
+): Promise<{ content: string; toolCalls: AgentToolCall[] }> {
+  let content = '';
+  const toolCalls: AgentToolCall[] = [];
+  const chatChunks = createChatChunkFlusher(win);
+
+  try {
+    for await (const event of api.sendMessages(messages, model)) {
+      if (event.type === 'chunk' && event.text) {
+        stats.chunkCount++;
+        stats.streamedChars += event.text.length;
+        content += event.text;
+        const commandMatch = event.text.match(/(?:^|\n)(?:\$\s+)?(ls\s+|sed\s+|mkdir\s+|cd\s+|cp\s+|mv\s+|rm\s+|git\s+|npm\s+|pip\s+|python\s+|node\s+)[^\n]+/);
+        if (commandMatch) {
+          state.commands.push(commandMatch[0].trim());
+          logAgentRunEvent(agentId, 'command_detected_in_stream', { command: commandMatch[0].trim() });
+          safeSend(win, ipcChannels.agentCommandFlash, commandMatch[0].trim());
+        }
+        chatChunks.append(event.text);
+      } else if (event.type === 'tool_call' && event.name) {
+        chatChunks.flush();
+        toolCalls.push({
+          id: event.id || `tool_${randomUUID()}`,
+          name: event.name,
+          arguments: event.arguments || '{}'
+        });
+      } else if (event.type === 'error' && event.error) {
+        throw new Error(event.error);
+      }
+    }
+  } finally {
+    chatChunks.dispose();
+  }
+
+  return { content, toolCalls };
+}
+
 async function processAgentStream(
   api: WorkerApi,
   request: VoiceTurnRequest,
@@ -1188,501 +1918,75 @@ async function processAgentStream(
     model: request.model,
     history: request.conversationHistory.length
   });
-  let fullResponse = '';
-  let chunkCount = 0;
-  let streamedChars = 0;
-  const chatChunks = createChatChunkFlusher(win);
+
+  const messages = buildInitialAgentMessages(request, state);
+  const stats = { chunkCount: 0, streamedChars: 0, commands: state.commands };
 
   try {
-    for await (const event of api.sendTurn(request)) {
-      if (event.type === 'chunk' && event.text) {
-        chunkCount++;
-        streamedChars += event.text.length;
-        fullResponse += event.text;
-        const commandMatch = event.text.match(/(?:^|\n)(?:\$\s+)?(ls\s+|sed\s+|mkdir\s+|cd\s+|cp\s+|mv\s+|rm\s+|git\s+|npm\s+|pip\s+|python\s+|node\s+)[^\n]+/);
-        if (commandMatch) {
-          state.commands.push(commandMatch[0].trim());
-          logAgentRunEvent(agentId, 'command_detected_in_stream', { command: commandMatch[0].trim() });
-          console.log('[clicky:agent] command detected in stream', {
-            agentId,
-            command: commandMatch[0].trim()
-          });
-          safeSend(win, ipcChannels.agentCommandFlash, commandMatch[0].trim());
-        }
-        chatChunks.append(event.text);
-      } else if (event.type === 'tool_call' && event.name === 'execute_bash_command') {
-        chatChunks.flush();
-        let args: { command?: string } = {};
-        try {
-          args = event.arguments ? JSON.parse(event.arguments) as { command?: string } : {};
-        } catch {
-          args = {};
-        }
-        const command = args.command;
-        if (command) {
-          state.commands.push(command);
-          logAgentRunEvent(agentId, 'tool_call', {
-            name: 'execute_bash_command',
-            arguments: { command }
-          });
-          console.log('[clicky:agent] executing tool command', { agentId, command });
-          safeSend(win, ipcChannels.agentCommandFlash, command);
+    for (let step = 0; step < MAX_AGENT_TOOL_STEPS; step++) {
+      const { content, toolCalls } = await collectModelStep(api, request.model, messages, win, state, agentId, stats);
 
-          const result = await executeShellCommand(command);
-          logAgentRunEvent(agentId, 'tool_result', {
-            name: 'execute_bash_command',
-            ok: !result.error,
-            stdout: trimLogText(result.stdout),
-            stderr: trimLogText(result.stderr),
-            error: result.error
-          });
-          console.log('[clicky:agent] tool command completed', {
-            agentId,
-            stdoutChars: result.stdout.length,
-            stderrChars: result.stderr.length,
-            error: result.error
-          });
+      if (toolCalls.length === 0) {
+        finishAgentStream(api, win, state, request, agentId, content, stats, `final-step-${step}`);
+        return;
+      }
 
-          const toolResultRequest: VoiceTurnRequest = {
-            transcript: `Command executed. Output:\n${result.stdout}\n${result.stderr}${result.error ? `\nError: ${result.error}` : ''}`.trim(),
-            captures: [],
-            model: request.model,
-            conversationHistory: [
-              ...request.conversationHistory,
-              { role: 'user', content: request.transcript },
-              { role: 'assistant', content: fullResponse }
-            ],
-            agentId
-          };
-
-          await processAgentStream(api, toolResultRequest, win, state, agentId);
-          return;
-        }
-      } else if (event.type === 'tool_call' && event.name === 'write_file') {
-        chatChunks.flush();
-        console.log('[clicky:agent] TOOL_CALL write_file RECEIVED', { agentId, argsChars: event.arguments?.length ?? 0 });
-        let args: { file_path?: string; content?: string } = {};
-        try {
-          args = event.arguments ? JSON.parse(event.arguments) as { file_path?: string; content?: string } : {};
-        } catch {
-          args = {};
-        }
-
-      const filePath = args.file_path;
-      const content = args.content;
-      if (filePath && typeof content === 'string') {
-        const feedback = `Writing ${filePath}`;
-        state.commands.push(feedback);
-        logAgentRunEvent(agentId, 'tool_call', {
-          name: 'write_file',
-          arguments: { file_path: filePath, contentChars: content.length }
+      appendAssistantToolCallMessage(messages, content, toolCalls);
+      for (const toolCall of toolCalls) {
+        console.log('[clicky:agent] TOOL_CALL received', {
+          agentId,
+          id: toolCall.id,
+          name: toolCall.name,
+          argsChars: toolCall.arguments.length
         });
-        safeSend(win, ipcChannels.agentCommandFlash, feedback);
-
-        let transcript: string;
+        logAgentRunEvent(agentId, 'tool_call', {
+          id: toolCall.id,
+          name: toolCall.name,
+          arguments: trimLogText(toolCall.arguments)
+        });
+        let toolOutput: string;
         try {
-          const writtenPath = await writeGeneratedFile(filePath, content);
-          logAgentRunEvent(agentId, 'tool_result', {
-            name: 'write_file',
-            ok: true,
-            path: writtenPath,
-            chars: content.length
+          const result = await executeRealtimeToolRequest({
+            name: toolCall.name,
+            arguments: toolCall.arguments,
+            agentId
           });
-          console.log('[clicky:agent] file written', { agentId, path: writtenPath, chars: content.length });
-          transcript = `File written successfully: ${writtenPath}\nNext, launch it if this is an app, website, game, tool, or script.`;
+          if (result.done && result.kind === 'sideEffectOnly') {
+            const userMessage = result.userMessage || result.output || 'Done.';
+            logAgentRunEvent(agentId, 'local_tool_completion', {
+              id: toolCall.id,
+              name: toolCall.name,
+              message: userMessage
+            });
+            finishAgentStream(api, win, state, request, agentId, formatLocalToolCompletion(userMessage), stats, `local-tool-${toolCall.name}`);
+            return;
+          }
+          toolOutput = result.output;
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
+          toolOutput = `Tool ${toolCall.name} failed before execution completed: ${message}`;
           logAgentRunEvent(agentId, 'tool_result', {
-            name: 'write_file',
+            id: toolCall.id,
+            name: toolCall.name,
             ok: false,
-            path: filePath,
             error: message
           });
-          console.error('[clicky:agent] write_file failed', { agentId, filePath, error: message });
-          transcript = `I was unable to write the file. Error: ${message}`;
         }
-
-        const toolResultRequest: VoiceTurnRequest = {
-          transcript,
-          captures: [],
-          model: request.model,
-          conversationHistory: [
-            ...request.conversationHistory,
-            { role: 'user', content: request.transcript },
-            { role: 'assistant', content: fullResponse }
-          ],
-          agentId
-        };
-
-        await processAgentStream(api, toolResultRequest, win, state, agentId);
-        return;
+        appendToolResultMessage(messages, toolCall.id, toolOutput);
       }
-    } else if (event.type === 'tool_call' && event.name === 'check_email') {
-      chatChunks.flush();
-      console.log('[clicky:agent] TOOL_CALL check_email RECEIVED', { agentId, args: event.arguments });
-      let args: { count?: number } = {};
-      try {
-        args = event.arguments ? JSON.parse(event.arguments) as { count?: number } : {};
-      } catch {
-        args = {};
-      }
-      const count = Math.min(Math.max(args.count ?? 5, 1), 10);
-      console.log('[clicky:agent] checking emails', { agentId, count, emailSettings: summarizeEmailConfig(settings.email) });
-      logAgentRunEvent(agentId, 'tool_call', {
-        name: 'check_email',
-        arguments: { count },
-        emailSettings: summarizeEmailConfig(settings.email)
-      });
-      state.commands.push('Checking emails...');
-      persistAgentStateSnapshot(state, 'check-email-started');
-      safeSend(win, ipcChannels.agentCommandFlash, 'Checking emails...');
-
-      try {
-        const { fetchRecentEmails } = await import('./emailService');
-        const emailConfig = settings.email ?? { enabled: false, provider: 'gmail', username: '', password: '' };
-        console.log('[clicky:agent] email config resolved', { enabled: emailConfig.enabled, username: emailConfig.username, hasPassword: !!emailConfig.password });
-        const emails = await withTimeout(fetchRecentEmails(emailConfig, count), 12_000, 'Email check timed out');
-        state.emails = emails;
-        logAgentRunEvent(agentId, 'tool_result', {
-          name: 'check_email',
-          ok: true,
-          emailCount: emails.length
-        });
-        const emailSummary = emails.length === 0
-          ? 'No emails found in your inbox.'
-          : emails.map((e, i) => {
-              let text = `Email #${i + 1}\nFrom: ${e.from}\nSubject: ${e.subject}\nDate: ${e.date}\nPreview: ${e.preview}`;
-              if (e.attachments.length > 0) {
-                text += `\nAttachments: ${e.attachments.join(', ')}`;
-              }
-              return text;
-            }).join('\n\n');
-
-        const displaySummary = buildRecentEmailDisplaySummary(emails);
-        state.displayHeader = displaySummary.header;
-        state.displayCaption = displaySummary.caption;
-        state.displayDetails = displaySummary.details;
-        state.summary = displaySummary.caption;
-        safeSend(win, ipcChannels.agentUpdate, state);
-
-        const toolResultRequest: VoiceTurnRequest = {
-          transcript: `Here are the recent emails:\n${emailSummary}`,
-          captures: [],
-          model: request.model,
-          conversationHistory: [
-            ...request.conversationHistory,
-            { role: 'user', content: request.transcript },
-            { role: 'assistant', content: fullResponse }
-          ],
-          agentId
-        };
-
-        await processAgentStream(api, toolResultRequest, win, state, agentId);
-        return;
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        console.error('[clicky:agent] email check failed', { agentId, error: message });
-        logAgentRunEvent(agentId, 'tool_result', {
-          name: 'check_email',
-          ok: false,
-          error: message
-        });
-        state.displayHeader = 'Email check failed';
-        state.displayCaption = `I tried to check your inbox, but the email tool failed: ${message}`;
-        state.summary = state.displayCaption;
-        state.commands.push('Email check failed');
-        persistAgentStateSnapshot(state, 'check-email-failed');
-        safeSend(win, ipcChannels.agentCommandFlash, 'Email check failed');
-        safeSend(win, ipcChannels.agentUpdate, state);
-        const toolResultRequest: VoiceTurnRequest = {
-          transcript: `Email check failed. I tried to access the user's configured inbox, but the email tool returned this error: ${message}. Tell the user that the email check failed because of this tool error, and do not imply that you skipped checking email.`,
-          captures: [],
-          model: request.model,
-          conversationHistory: [
-            ...request.conversationHistory,
-            { role: 'user', content: request.transcript },
-            { role: 'assistant', content: fullResponse }
-          ],
-          agentId
-        };
-        await processAgentStream(api, toolResultRequest, win, state, agentId);
-        return;
-      }
-    } else if (event.type === 'tool_call' && event.name === 'open_url') {
-      chatChunks.flush();
-      console.log('[clicky:agent] TOOL_CALL open_url RECEIVED', { agentId, args: event.arguments });
-      let args: { url?: string } = {};
-      try {
-        args = event.arguments ? JSON.parse(event.arguments) as { url?: string } : {};
-      } catch {
-        args = {};
-      }
-      const url = args.url;
-      if (url) {
-        logAgentRunEvent(agentId, 'tool_call', { name: 'open_url', arguments: { url } });
-        safeSend(win, ipcChannels.agentCommandFlash, `Opening ${url} in browser...`);
-        try {
-          await shell.openExternal(url);
-          logAgentRunEvent(agentId, 'tool_result', { name: 'open_url', ok: true, url });
-          console.log('[clicky:agent] URL opened successfully', { agentId, url });
-          const toolResultRequest: VoiceTurnRequest = {
-            transcript: `The link has been opened in the user's default browser.`,
-            captures: [],
-            model: request.model,
-            conversationHistory: [
-              ...request.conversationHistory,
-              { role: 'user', content: request.transcript },
-              { role: 'assistant', content: fullResponse }
-            ],
-            agentId
-          };
-          await processAgentStream(api, toolResultRequest, win, state, agentId);
-          return;
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          logAgentRunEvent(agentId, 'tool_result', { name: 'open_url', ok: false, url, error: message });
-          console.error('[clicky:agent] open_url failed', { agentId, url, error: message });
-          const toolResultRequest: VoiceTurnRequest = {
-            transcript: `I was unable to open the link. Error: ${message}`,
-            captures: [],
-            model: request.model,
-            conversationHistory: [
-              ...request.conversationHistory,
-              { role: 'user', content: request.transcript },
-              { role: 'assistant', content: fullResponse }
-            ],
-            agentId
-          };
-          await processAgentStream(api, toolResultRequest, win, state, agentId);
-          return;
-        }
-      }
-    } else if (event.type === 'tool_call' && event.name === 'scrape_website') {
-      chatChunks.flush();
-      console.log('[clicky:agent] TOOL_CALL scrape_website RECEIVED', { agentId, args: event.arguments });
-      let args: { url?: string; extractMode?: string; maxChars?: number } = {};
-      try {
-        args = event.arguments ? JSON.parse(event.arguments) as { url?: string; extractMode?: string; maxChars?: number } : {};
-      } catch {
-        args = {};
-      }
-      const url = args.url;
-      if (url) {
-        logAgentRunEvent(agentId, 'tool_call', {
-          name: 'scrape_website',
-          arguments: { url, extractMode: args.extractMode, maxChars: args.maxChars }
-        });
-        safeSend(win, ipcChannels.agentCommandFlash, `Scraping ${url}...`);
-        try {
-          const result = await scrapeWebsite({
-            url,
-            extractMode: args.extractMode === 'text' ? 'text' : 'markdown',
-            maxChars: args.maxChars,
-          });
-          logAgentRunEvent(agentId, 'tool_result', {
-            name: 'scrape_website',
-            ok: true,
-            url,
-            extractor: result.extractor,
-            textChars: result.text.length
-          });
-          console.log('[clicky:agent] website scraped successfully', { agentId, url, extractor: result.extractor });
-          const prefix = result.title ? `# ${result.title}\n\n` : '';
-          const toolResultRequest: VoiceTurnRequest = {
-            transcript: `Here is the content from ${url}:\n\n${prefix}${result.text}`,
-            captures: [],
-            model: request.model,
-            conversationHistory: [
-              ...request.conversationHistory,
-              { role: 'user', content: request.transcript },
-              { role: 'assistant', content: fullResponse }
-            ],
-            agentId
-          };
-          await processAgentStream(api, toolResultRequest, win, state, agentId);
-          return;
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          logAgentRunEvent(agentId, 'tool_result', { name: 'scrape_website', ok: false, url, error: message });
-          console.error('[clicky:agent] scrape_website failed', { agentId, url, error: message });
-          const toolResultRequest: VoiceTurnRequest = {
-            transcript: `I was unable to scrape the website. Error: ${message}`,
-            captures: [],
-            model: request.model,
-            conversationHistory: [
-              ...request.conversationHistory,
-              { role: 'user', content: request.transcript },
-              { role: 'assistant', content: fullResponse }
-            ],
-            agentId
-          };
-          await processAgentStream(api, toolResultRequest, win, state, agentId);
-          return;
-        }
-      }
-    } else if (event.type === 'tool_call' && event.name === 'download_email_attachment') {
-      chatChunks.flush();
-      console.log('[clicky:agent] TOOL_CALL download_email_attachment RECEIVED', { agentId, args: event.arguments });
-      let args: { email_number?: number; filename?: string } = {};
-      try {
-        args = event.arguments ? JSON.parse(event.arguments) as { email_number?: number; filename?: string } : {};
-      } catch {
-        args = {};
-      }
-      const emailNumber = args.email_number;
-      const filename = args.filename;
-      logAgentRunEvent(agentId, 'tool_call', {
-        name: 'download_email_attachment',
-        arguments: { email_number: emailNumber, filename }
-      });
-      const emails = state.emails ?? [];
-      const email = emailNumber && emailNumber > 0 && emailNumber <= emails.length ? emails[emailNumber - 1] : undefined;
-
-      if (!email || !filename) {
-        const toolResultRequest: VoiceTurnRequest = {
-          transcript: 'I could not find the email or attachment you asked for. Please specify the email number and filename clearly.',
-          captures: [],
-          model: request.model,
-          conversationHistory: [
-            ...request.conversationHistory,
-            { role: 'user', content: request.transcript },
-            { role: 'assistant', content: fullResponse }
-          ],
-          agentId
-        };
-        await processAgentStream(api, toolResultRequest, win, state, agentId);
-        return;
-      }
-
-      safeSend(win, ipcChannels.agentCommandFlash, `Downloading ${filename}...`);
-      try {
-        const emailConfig = settings.email ?? { enabled: false, provider: 'gmail', username: '', password: '' };
-        const { downloadAttachment } = await import('./emailService');
-        const destPath = await ensureUniquePath(app.getPath('downloads'), filename);
-        await downloadAttachment(emailConfig, email.uid, filename, destPath);
-        logAgentRunEvent(agentId, 'tool_result', {
-          name: 'download_email_attachment',
-          ok: true,
-          uid: email.uid,
-          filename,
-          destPath
-        });
-        console.log('[clicky:agent] attachment downloaded', { agentId, uid: email.uid, filename, destPath });
-        const toolResultRequest: VoiceTurnRequest = {
-          transcript: `The attachment "${filename}" has been downloaded to ${destPath}.`,
-          captures: [],
-          model: request.model,
-          conversationHistory: [
-            ...request.conversationHistory,
-            { role: 'user', content: request.transcript },
-            { role: 'assistant', content: fullResponse }
-          ],
-          agentId
-        };
-        await processAgentStream(api, toolResultRequest, win, state, agentId);
-        return;
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        logAgentRunEvent(agentId, 'tool_result', {
-          name: 'download_email_attachment',
-          ok: false,
-          uid: email.uid,
-          filename,
-          error: message
-        });
-        console.error('[clicky:agent] download_email_attachment failed', { agentId, uid: email.uid, filename, error: message });
-        const toolResultRequest: VoiceTurnRequest = {
-          transcript: `I was unable to download the attachment "${filename}". Error: ${message}`,
-          captures: [],
-          model: request.model,
-          conversationHistory: [
-            ...request.conversationHistory,
-            { role: 'user', content: request.transcript },
-            { role: 'assistant', content: fullResponse }
-          ],
-          agentId
-        };
-        await processAgentStream(api, toolResultRequest, win, state, agentId);
-        return;
-      }
-    } else if (event.type === 'done') {
-      chatChunks.flush();
-      state.status = 'done';
-      const split = splitAgentReply(fullResponse);
-      state.response = split.spokenText;
-      const hasEmailDisplaySummary = Array.isArray(state.emails) && request.transcript.startsWith('Here are the recent emails:');
-      const emailDisplaySummary = hasEmailDisplaySummary ? buildRecentEmailDisplaySummary(state.emails ?? []) : undefined;
-      if (emailDisplaySummary) {
-        state.displayHeader = emailDisplaySummary.header;
-        state.displayCaption = emailDisplaySummary.caption;
-        state.displayDetails = emailDisplaySummary.details;
-      } else {
-        const llmDisplaySummary = compactDisplaySummary({
-          header: split.displayHeader || split.displayCaption || split.spokenText,
-          caption: split.displayCaption || split.displayHeader || split.spokenText
-        });
-        if (split.displayCaption.trim()) {
-          state.displayCaption = llmDisplaySummary.caption;
-        }
-        if (split.displayHeader.trim()) {
-          state.displayHeader = llmDisplaySummary.header;
-        }
-        state.displayDetails = undefined;
-      }
-      {
-        const caption = split.displayCaption.trim();
-        const headerLine = split.displayHeader.trim();
-        const spokenTrim = split.spokenText.trim();
-        const clipped = (t: string) => t.slice(0, 200) + (t.length > 200 ? '...' : '');
-        state.summary = emailDisplaySummary
-          ? emailDisplaySummary.caption
-          : caption ? clipped(caption) : headerLine ? clipped(headerLine) : clipped(spokenTrim);
-      }
-      state.completedAt = Date.now();
-      state.actions = [];
-      state.conversationHistory = [
-        ...request.conversationHistory,
-        { role: 'user', content: request.transcript },
-        { role: 'assistant', content: split.spokenText }
-      ];
-      console.log('[clicky:agent] stream done', {
-        agentId,
-        responseChars: fullResponse.length,
-        spokenChars: split.spokenText.length,
-        headerChars: split.displayHeader.length,
-        captionChars: split.displayCaption.length,
-        chunks: chunkCount,
-        streamedChars,
-        commands: state.commands.length
-      });
-      logAgentRunEvent(agentId, 'stream_done', {
-        response: trimLogText(fullResponse),
-        spokenText: trimLogText(split.spokenText),
-        displayHeader: split.displayHeader,
-        displayCaption: split.displayCaption,
-        chunks: chunkCount,
-        streamedChars,
-        commands: state.commands
-      });
-      persistAgentStateSnapshot(state, 'stream-done');
-      safeSend(win, ipcChannels.chatDone);
-      safeSend(win, ipcChannels.agentUpdate, state);
-      if (split.spokenText) {
-        speakWithOpenAiInBackground(api, win, agentId, split.spokenText, 'response');
-      }
-    } else if (event.type === 'error' && event.error) {
-      chatChunks.flush();
-      state.status = 'error';
-      state.error = event.error;
-      console.error('[clicky:agent] stream error', { agentId, error: event.error });
-      logAgentRunEvent(agentId, 'stream_error', { error: event.error });
-      persistAgentStateSnapshot(state, 'stream-error');
-      safeSend(win, ipcChannels.chatError, event.error);
-      safeSend(win, ipcChannels.agentUpdate, state);
     }
-  }
-  } finally {
-    chatChunks.dispose();
+
+    const limitMessage = 'I reached the tool step limit before completing the task. I stopped to avoid looping.';
+    finishAgentStream(api, win, state, request, agentId, `<<<HEADER>>>\nTool limit reached\n<<<UI>>>\n${limitMessage}\n<<<SPOKEN>>>\n${limitMessage}`, stats, 'tool-step-limit');
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    state.status = 'error';
+    state.error = message;
+    console.error('[clicky:agent] stream error', { agentId, error: message });
+    logAgentRunEvent(agentId, 'stream_error', { error: message });
+    persistAgentStateSnapshot(state, 'stream-error');
+    safeSend(win, ipcChannels.chatError, message);
+    safeSend(win, ipcChannels.agentUpdate, state);
   }
 }
 
@@ -1721,13 +2025,24 @@ function isWayland(): boolean {
 
 function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
   console.log('[clicky:timeout] wrapping call with', ms, 'ms timeout');
-  const timer = setTimeout(() => {
-    console.log('[clicky:timeout] TIMEOUT FIRED:', message);
-  }, ms);
-  return Promise.race([
-    promise.then((val) => { clearTimeout(timer); return val; }),
-    new Promise<T>((_, reject) => setTimeout(() => { console.log('[clicky:timeout] rejecting with', message); reject(new Error(message)); }, ms))
-  ]);
+  return new Promise<T>((resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      console.log('[clicky:timeout] TIMEOUT FIRED:', message);
+      console.log('[clicky:timeout] rejecting with', message);
+      reject(new Error(message));
+    }, ms);
+
+    promise.then(
+      (value) => {
+        clearTimeout(timeoutId);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timeoutId);
+        reject(error);
+      }
+    );
+  });
 }
 
 async function tryGrimScreenshot(): Promise<ScreenCapturePayload | null> {
@@ -1742,6 +2057,58 @@ async function tryGrimScreenshot(): Promise<ScreenCapturePayload | null> {
     return {
       jpegBase64: jpegBuffer.toString('base64'),
       label: 'Linux screen (grim)',
+      width,
+      height
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function tryGnomeShellScreenshot(): Promise<ScreenCapturePayload | null> {
+  if (!isWayland()) return null;
+  try {
+    const tmpPath = join(tmpdir(), `clicky-screenshot-${randomUUID()}.jpg`);
+    const display = screen.getPrimaryDisplay();
+    const { width, height } = display.size;
+    await execFileAsync('gdbus', [
+      'call',
+      '--session',
+      '--dest',
+      'org.gnome.Shell',
+      '--object-path',
+      '/org/gnome/Shell/Screenshot',
+      '--method',
+      'org.gnome.Shell.Screenshot.Screenshot',
+      'false',
+      'false',
+      tmpPath
+    ], { timeout: 10000 });
+    const jpegBuffer = await readFile(tmpPath);
+    await unlink(tmpPath).catch(() => {});
+    return {
+      jpegBase64: jpegBuffer.toString('base64'),
+      label: 'Linux screen (gnome-shell)',
+      width,
+      height
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function tryGnomeScreenshotBinary(): Promise<ScreenCapturePayload | null> {
+  if (!isWayland()) return null;
+  try {
+    const tmpPath = join(tmpdir(), `clicky-screenshot-${randomUUID()}.jpg`);
+    const display = screen.getPrimaryDisplay();
+    const { width, height } = display.size;
+    await execFileAsync('gnome-screenshot', ['-f', tmpPath], { timeout: 10000 });
+    const jpegBuffer = await readFile(tmpPath);
+    await unlink(tmpPath).catch(() => {});
+    return {
+      jpegBase64: jpegBuffer.toString('base64'),
+      label: 'Linux screen (gnome-screenshot)',
       width,
       height
     };
@@ -1777,7 +2144,18 @@ ipcMain.handle(ipcChannels.captureTakeScreenshot, async (): Promise<ScreenCaptur
       console.log('[clicky:capture] screenshot taken via grim');
       return grimResult;
     }
-    console.log('[clicky:capture] grim failed, falling back to desktopCapturer');
+    const gnomeShellResult = await tryGnomeShellScreenshot();
+    if (gnomeShellResult) {
+      console.log('[clicky:capture] screenshot taken via gnome-shell screenshot dbus');
+      return gnomeShellResult;
+    }
+    const gnomeScreenshotResult = await tryGnomeScreenshotBinary();
+    if (gnomeScreenshotResult) {
+      console.log('[clicky:capture] screenshot taken via gnome-screenshot');
+      return gnomeScreenshotResult;
+    }
+    console.warn('[clicky:capture] linux screenshot backends failed; skipping capture to avoid system screen-share picker');
+    throw new Error('Wayland screenshot unavailable without system picker');
   } else {
     const ffmpegResult = await tryFfmpegScreenshot();
     if (ffmpegResult) {
@@ -1821,7 +2199,7 @@ ipcMain.handle(ipcChannels.chatSendTurn, async (_event, request: VoiceTurnReques
     transcript: request.transcript,
     captures: request.captures.length
   });
-  const api = new WorkerApi({ workerBaseUrl: settings.workerBaseUrl });
+  const api = createAgentWorkerApi();
   const targetWindow = request.agentId ? agents.get(request.agentId)?.window : undefined;
   try {
     for await (const event of api.sendTurn(request)) {
@@ -1862,11 +2240,19 @@ ipcMain.handle(ipcChannels.realtimeExecuteTool, async (_event, request: Realtime
 ipcMain.handle(ipcChannels.ttsSpeak, async (_event, text: string, agentId?: string) => {
   const api = new WorkerApi({ workerBaseUrl: settings.workerBaseUrl });
   const targetWindow = agentId ? agents.get(agentId)?.window : undefined;
+  const sequence = agentId ? (ttsSequenceByAgent.get(agentId) ?? 0) + 1 : 0;
+  if (agentId) {
+    ttsSequenceByAgent.set(agentId, sequence);
+  }
   if (agentId) {
     logAgentRunEvent(agentId, 'tts_request', { reason: 'direct', text: trimLogText(text), chars: text.length });
   }
   try {
     const audio = await api.synthesizeSpeech(text);
+    if (agentId && ttsSequenceByAgent.get(agentId) !== sequence) {
+      logAgentRunEvent(agentId, 'tts_skipped_stale_direct', { sequence });
+      return;
+    }
     safeSend(targetWindow, ipcChannels.ttsAudio, audio);
     if (agentId) {
       logAgentRunEvent(agentId, 'tts_audio_sent', { reason: 'direct', bytes: audio.byteLength });
@@ -1922,7 +2308,7 @@ ipcMain.handle(ipcChannels.agentSpawn, async (_event, request: VoiceTurnRequest)
     safeSend(win, ipcChannels.agentUpdate, state);
   });
 
-  const api = new WorkerApi({ workerBaseUrl: settings.workerBaseUrl });
+  const api = createAgentWorkerApi();
   try {
     await waitForWindowLoad(win);
     speakTaskAcknowledgement(api, win, agentId, request.transcript);
@@ -2055,7 +2441,7 @@ ipcMain.handle(ipcChannels.agentFollowUp, async (_event, agentId: string, reques
   persistAgentStateSnapshot(state, 'follow-up-started');
   safeSend(win, ipcChannels.agentUpdate, state);
 
-  const api = new WorkerApi({ workerBaseUrl: settings.workerBaseUrl });
+  const api = createAgentWorkerApi();
   try {
     speakTaskAcknowledgement(api, win, agentId, request.transcript);
     await processAgentStream(api, { ...request, agentId }, win, state, agentId);

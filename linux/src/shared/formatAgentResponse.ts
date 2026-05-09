@@ -9,6 +9,53 @@ const GLUED_PHRASES: Array<[RegExp, string]> = [
   [/\bysure\b/gi, 'sure']
 ];
 
+const GLUED_WORD_PARTS = new Set([
+  'a', 'an', 'and', 'app', 'at', 'build', 'check', 'coffee', 'command', 'desktop', 'done', 'email', 'file', 'files', 'for',
+  'from', 'in', 'is', 'it', 'landing', 'latest', 'looks', 'mail', 'make', 'message', 'minimal', 'new', 'of', 'on', 'open',
+  'page', 'sent', 'shop', 'task', 'tasks', 'text', 'that', 'the', 'this', 'to', 'up', 'update', 'voice', 'web', 'with', 'work', 'working', 'you', 'your'
+]);
+
+function splitGluedLowercaseToken(token: string): string {
+  if (!/^[a-z]{14,}$/.test(token)) return token;
+
+  const n = token.length;
+  const bestScore = new Array<number>(n + 1).fill(Number.NEGATIVE_INFINITY);
+  const prev = new Array<number>(n + 1).fill(-1);
+  bestScore[0] = 0;
+
+  for (let i = 0; i < n; i++) {
+    if (!Number.isFinite(bestScore[i])) continue;
+    for (let j = i + 1; j <= Math.min(n, i + 16); j++) {
+      const part = token.slice(i, j);
+      const isKnown = GLUED_WORD_PARTS.has(part);
+      const score = bestScore[i] + (isKnown ? part.length : -2.2);
+      if (score > bestScore[j]) {
+        bestScore[j] = score;
+        prev[j] = i;
+      }
+    }
+  }
+
+  if (!Number.isFinite(bestScore[n]) || prev[n] < 0) return token;
+
+  const parts: string[] = [];
+  let idx = n;
+  let covered = 0;
+  while (idx > 0) {
+    const start = prev[idx];
+    if (start < 0) return token;
+    const part = token.slice(start, idx);
+    if (GLUED_WORD_PARTS.has(part)) covered += part.length;
+    parts.push(part);
+    idx = start;
+  }
+  parts.reverse();
+
+  // Keep this conservative so we avoid damaging normal words.
+  if (covered / n < 0.7 || parts.length < 3) return token;
+  return parts.join(' ');
+}
+
 export function formatAgentResponseForDisplay(raw: string): string {
   let s = stripPointTags(raw).trim();
   if (!s) return '';
@@ -33,6 +80,7 @@ export function formatAgentResponseForDisplay(raw: string): string {
   s = s.replace(/\b([a-z]{2,})([A-Z][a-z]+)\b/g, '$1 $2');
   s = s.replace(/([A-Za-z])(\d)/g, '$1 $2');
   s = s.replace(/(\d)([A-Za-z])/g, '$1 $2');
+  s = s.replace(/\b[a-z]{14,}\b/g, (token) => splitGluedLowercaseToken(token));
 
   s = s.replace(/,([^\d\s])/g, ', $1');
   s = s.replace(/(\d),(\d{4})\b/g, '$1, $2');

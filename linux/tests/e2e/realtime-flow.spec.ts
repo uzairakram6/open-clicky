@@ -108,7 +108,7 @@ async function waitForScenarioProgress(page: Page, scenario: Scenario): Promise<
   if (scenario === 'generic') return;
   const patterns: Record<Exclude<Scenario, 'generic'>, RegExp> = {
     email: /checking.*email/i,
-    declutter: /moving.*files.*trash|cleaning desktop/i,
+    declutter: /mov(?:ing|ed).*files.*trash|cleaning desktop/i,
     website: /writing|opening|website|app|running/i
   };
   await page.waitForFunction(

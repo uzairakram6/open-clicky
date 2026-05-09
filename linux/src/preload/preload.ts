@@ -36,6 +36,7 @@ const api = {
   onChatDone: (callback: () => void) => listen(ipcChannels.chatDone, callback),
   onChatError: (callback: (error: string) => void) => listen(ipcChannels.chatError, callback),
   onTtsAudio: (callback: (audio: ArrayBuffer) => void) => listen(ipcChannels.ttsAudio, callback),
+  onTtsStop: (callback: () => void) => listen(ipcChannels.ttsStop, callback),
   onTtsError: (callback: (error: string) => void) => listen(ipcChannels.ttsError, callback),
   onAgentUpdate: (callback: (state: AgentState) => void) => listen(ipcChannels.agentUpdate, callback),
   onAgentCommandFlash: (callback: (command: string) => void) => listen(ipcChannels.agentCommandFlash, callback),

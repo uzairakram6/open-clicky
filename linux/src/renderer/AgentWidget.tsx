@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { formatAgentResponseForDisplay } from '../shared/formatAgentResponse';
 import type { AgentState, ScreenCapturePayload } from '../shared/types';
-import { playAudioBytes } from './playAudio';
+import { playAudioBytes, stopAudioPlayback } from './playAudio';
 import { RealtimeAgentSession } from './realtimeAgent';
 import { useVoiceRecorder } from './useVoiceRecorder';
 
@@ -12,21 +12,45 @@ export interface AgentWidgetProps {
   color?: string;
 }
 
-function inferToolType(command: string, transcript: string): { tone: 'blue' | 'green' | 'red'; label: string } {
+function inferToolType(command: string, transcript: string): { tone: 'blue' | 'green' | 'red'; label: string; activity: string } {
   const cmd = command.toLowerCase();
   const t = transcript.toLowerCase();
 
-  if (cmd.includes('writing /tmp/clicky_apps') || cmd.includes('write_file')) {
-    return { tone: 'green', label: 'BUILDING APP' };
+  if (cmd.includes('creating local files') || cmd.includes('writing /tmp/clicky_apps') || cmd.includes('write_file')) {
+    return { tone: 'green', label: 'BUILDING APP', activity: 'Creating the local files' };
   }
-  if (cmd.includes('/tmp/clicky_apps') && (cmd.includes('xdg-open') || cmd.includes('python'))) {
-    return { tone: 'green', label: 'LAUNCHING APP' };
+  if (cmd.includes('opening generated website') || (cmd.includes('/tmp/clicky_apps') && (cmd.includes('xdg-open') || cmd.includes('python')))) {
+    return { tone: 'green', label: 'LAUNCHING APP', activity: 'Opening the finished preview' };
   }
   if (cmd.includes('opening') && (cmd.includes('http') || cmd.includes('browser'))) {
-    return { tone: 'blue', label: 'OPENING LINK' };
+    return { tone: 'blue', label: 'OPENING LINK', activity: 'Opening it in the browser' };
   }
-  if (cmd.includes('scraping')) {
-    return { tone: 'blue', label: 'SCRAPING WEB' };
+  if (cmd.includes('opening')) {
+    return { tone: 'green', label: 'OPENING FILE', activity: 'Opening the file' };
+  }
+  if (cmd.includes('downloading')) {
+    return { tone: 'blue', label: 'DOWNLOADING FILE', activity: 'Downloading the attachment' };
+  }
+  if (cmd.includes('reading')) {
+    return { tone: 'blue', label: 'READING FILE', activity: 'Reading the attachment' };
+  }
+  if (cmd.includes('checking email') || cmd.includes('fetching recent emails')) {
+    return { tone: 'blue', label: 'CHECKING EMAIL', activity: 'Checking recent messages' };
+  }
+  if (cmd.includes('reading website') || cmd.includes('scraping')) {
+    return { tone: 'blue', label: 'SCRAPING WEB', activity: 'Reading the web page' };
+  }
+  if (cmd.includes('updating local files')) {
+    return { tone: 'green', label: 'UPDATING FILES', activity: 'Updating local files' };
+  }
+  if (cmd.includes('running project task')) {
+    return { tone: 'green', label: 'RUNNING TASK', activity: 'Running the project task' };
+  }
+  if (cmd.includes('running local script')) {
+    return { tone: 'green', label: 'RUNNING SCRIPT', activity: 'Running the local script' };
+  }
+  if (cmd.includes('working locally')) {
+    return { tone: 'green', label: 'WORKING LOCALLY', activity: 'Working on your machine' };
   }
   if (
     cmd.includes('ls') ||
@@ -46,21 +70,21 @@ function inferToolType(command: string, transcript: string): { tone: 'blue' | 'g
     cmd.includes('curl') ||
     cmd.includes('wget')
   ) {
-    return { tone: 'green', label: 'EXECUTING COMMAND' };
+    return { tone: 'green', label: 'WORKING LOCALLY', activity: 'Working on your machine' };
   }
   if (t.includes('search') || t.includes('google') || t.includes('find') || t.includes('look up') || t.includes('web')) {
-    return { tone: 'blue', label: 'SEARCHING WEB' };
+    return { tone: 'blue', label: 'SEARCHING WEB', activity: 'Looking up the information' };
   }
   if (t.includes('reminder') || t.includes('calendar') || t.includes('schedule') || t.includes('event')) {
-    return { tone: 'red', label: 'UPDATING CALENDAR' };
+    return { tone: 'red', label: 'UPDATING CALENDAR', activity: 'Updating your schedule' };
   }
   if (t.includes('file') || t.includes('folder') || t.includes('desktop') || t.includes('document') || t.includes('directory')) {
-    return { tone: 'green', label: 'ORGANIZING FILES' };
+    return { tone: 'green', label: 'WORKING WITH FILES', activity: 'Handling the file task' };
   }
   if (t.includes('email') || t.includes('mail') || t.includes('message') || t.includes('slack')) {
-    return { tone: 'blue', label: 'CHECKING MESSAGES' };
+    return { tone: 'blue', label: 'CHECKING MESSAGES', activity: 'Checking your messages' };
   }
-  return { tone: 'green', label: 'WORKING' };
+  return { tone: 'green', label: 'WORKING', activity: 'Working on it' };
 }
 
 function truncateCaption(s: string, max: number): string {
@@ -88,12 +112,25 @@ export function AgentWidget({ agentId, color }: AgentWidgetProps) {
   const flashTimeoutRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const realtimeFinalTranscriptRef = useRef('');
   const realtimeAgentRef = useRef<RealtimeAgentSession | undefined>(undefined);
+  const realtimeStartPromiseRef = useRef<Promise<void> | undefined>(undefined);
+  const realtimeStartedAgentIdRef = useRef<string | undefined>(undefined);
+  const legacyFallbackStartedRef = useRef(false);
   const agentRef = useRef<AgentState | undefined>(undefined);
   const { transcript, level, isRecording, startRecording, stopRecording } = useVoiceRecorder();
 
   const startRealtimeAgent = useCallback(async (state?: AgentState) => {
     const current = state ?? agentRef.current;
-    if (!current || current.model !== 'gpt-realtime-2' || realtimeAgentRef.current) return;
+    if (!current || current.model !== 'gpt-realtime-2') return;
+    if (realtimeAgentRef.current || realtimeStartPromiseRef.current || realtimeStartedAgentIdRef.current === current.id) {
+      console.log('[clicky:realtime-agent] duplicate start suppressed', {
+        agentId,
+        hasSession: !!realtimeAgentRef.current,
+        hasStartPromise: !!realtimeStartPromiseRef.current,
+        startedAgentId: realtimeStartedAgentIdRef.current
+      });
+      return;
+    }
+    realtimeStartedAgentIdRef.current = current.id;
     const session = new RealtimeAgentSession({
       agentId,
       initialState: current,
@@ -105,16 +142,48 @@ export function AgentWidget({ agentId, color }: AgentWidgetProps) {
       onError: setError
     });
     realtimeAgentRef.current = session;
-    try {
-      await session.start();
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      console.error('[clicky:realtime-agent] start failed', { agentId, message });
-      setError(message);
-      setAgent((prev) => prev ? { ...prev, status: 'error', error: message, completedAt: Date.now() } : prev);
-      session.close();
-      realtimeAgentRef.current = undefined;
-    }
+    const startPromise = session.start()
+      .catch((err) => {
+        const message = err instanceof Error ? err.message : String(err);
+        console.error('[clicky:realtime-agent] start failed', { agentId, message });
+        session.close();
+        realtimeAgentRef.current = undefined;
+        if (!legacyFallbackStartedRef.current) {
+          legacyFallbackStartedRef.current = true;
+          const fallbackState = agentRef.current ?? current;
+          const next = {
+            ...fallbackState,
+            displayHeader: 'Retrying',
+            displayCaption: 'Switching to the standard agent path',
+            summary: 'Switching to the standard agent path'
+          };
+          agentRef.current = next;
+          setAgent(next);
+          window.clicky.reportAgentState(next, 'realtime-start-fallback');
+          return window.clicky.followUp(agentId, {
+            transcript: fallbackState.transcript,
+            captures: fallbackState.captures,
+            model: 'gpt-5.4-mini',
+            conversationHistory: fallbackState.conversationHistory,
+            agentId
+          }).catch((fallbackErr) => {
+            const fallbackMessage = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
+            setError(fallbackMessage || message);
+            setAgent((prev) => prev ? { ...prev, status: 'error', error: fallbackMessage || message, completedAt: Date.now() } : prev);
+          });
+        }
+        setError(message);
+        setAgent((prev) => prev ? { ...prev, status: 'error', error: message, completedAt: Date.now() } : prev);
+        realtimeStartedAgentIdRef.current = undefined;
+        return undefined;
+      })
+      .finally(() => {
+        if (realtimeStartPromiseRef.current === startPromise) {
+          realtimeStartPromiseRef.current = undefined;
+        }
+      });
+    realtimeStartPromiseRef.current = startPromise;
+    await startPromise;
   }, [agentId]);
 
   useEffect(() => {
@@ -141,6 +210,7 @@ export function AgentWidget({ agentId, color }: AgentWidgetProps) {
         setError(message);
       }),
       window.clicky.onTtsAudio(playAudioBytes),
+      window.clicky.onTtsStop(stopAudioPlayback),
       window.clicky.onTtsError(setError),
       window.clicky.onAgentCommandFlash((command) => {
         setFlashCommand(command);
@@ -279,21 +349,28 @@ export function AgentWidget({ agentId, color }: AgentWidgetProps) {
     setFollowUpMode('voice');
     realtimeFinalTranscriptRef.current = '';
 
-    await startRecording({
-      silenceMs: 2000,
-      useRealtime: true,
-      onSilence: () => {
-        void submitFollowUp();
-      },
-      onFinalTranscript: (text) => {
-        realtimeFinalTranscriptRef.current = text;
-        void submitFollowUp();
-      },
-      onRealtimeError: (message) => {
-        console.error('[clicky:agent] realtime transcription error:', message);
-      }
-    });
-  }, [startRecording, submitFollowUp]);
+    try {
+      await startRecording({
+        silenceMs: 2000,
+        useRealtime: true,
+        onSilence: () => {
+          void submitFollowUp();
+        },
+        onFinalTranscript: (text) => {
+          realtimeFinalTranscriptRef.current = text;
+          void submitFollowUp();
+        },
+        onRealtimeError: (message) => {
+          console.error('[clicky:agent] realtime transcription error:', message);
+        }
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error('[clicky:agent] voice follow-up start failed', { agentId, message });
+      setError(message || 'Microphone access failed');
+      setFollowUpMode('none');
+    }
+  }, [agentId, startRecording, submitFollowUp]);
 
   const stopVoiceFollowUp = useCallback(async () => {
     await stopRecording();
@@ -412,9 +489,16 @@ export function AgentWidget({ agentId, color }: AgentWidgetProps) {
         )}
 
         {(status === 'running' || isTerminalVisible) && activeCommand && (
-          <div key={activeCommand} className={`terminal-box ${status !== 'running' ? 'fade-out' : ''}`}>
-            <span className="terminal-text">{`> ${activeCommand}`}</span>
-            <span className="cursor-blink">█</span>
+          <div key={tool.activity} className={`tool-activity-card tone-${tool.tone} ${status !== 'running' ? 'fade-out' : ''}`}>
+            <span className="tool-loader" aria-hidden>
+              <span />
+              <span />
+              <span />
+            </span>
+            <div className="tool-activity-copy">
+              <span className="tool-activity-kicker">In progress</span>
+              <p>{tool.activity}</p>
+            </div>
           </div>
         )}
 
@@ -427,14 +511,16 @@ export function AgentWidget({ agentId, color }: AgentWidgetProps) {
 
       </section>
 
-      {followUpMode === 'voice' && isRecording && (
+      {followUpMode === 'voice' && (
         <section className="follow-up-recording">
           <div className="meter" aria-label="Audio level">
             <span style={{ width: `${level * 100}%` }} />
           </div>
-          <p>{transcript || 'Listening...'}</p>
+          <p>{isRecording ? (transcript || 'Listening...') : 'Starting microphone...'}</p>
           <div className="follow-up-buttons">
-            <button onClick={() => void submitFollowUp()}>Send</button>
+            <button onClick={() => void submitFollowUp()} disabled={!isRecording && !transcript.trim()}>
+              Send
+            </button>
             <button onClick={() => void stopVoiceFollowUp()}>Cancel</button>
           </div>
         </section>

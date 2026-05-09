@@ -20,6 +20,8 @@ test.describe('Clicky realtime acknowledgement flow', () => {
   test.skip(!process.env.OPENAI_API_KEY, 'Skipped: OPENAI_API_KEY not set');
 
   test('mocked voice transcript uses real realtime/tools and acknowledges email before final answer', async () => {
+    test.setTimeout(120_000);
+
     const { electronApp, mainWindow, teardown } = await launchE2EApp();
     const snapshots: AgentSnapshot[] = [];
 
@@ -47,6 +49,7 @@ test.describe('Clicky realtime acknowledgement flow', () => {
           const text = document.body.textContent ?? '';
           return /checking.*email/i.test(text);
         },
+        undefined,
         { timeout: 45_000 }
       );
 
@@ -55,6 +58,7 @@ test.describe('Clicky realtime acknowledgement flow', () => {
           const pill = document.querySelector('.status-pill');
           return pill?.classList.contains('done') || pill?.classList.contains('error');
         },
+        undefined,
         { timeout: 90_000 }
       );
 

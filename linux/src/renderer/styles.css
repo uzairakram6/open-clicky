@@ -623,45 +623,146 @@ button, input, select, textarea {
   word-break: break-word;
 }
 
-.terminal-box {
-  background: rgba(0, 0, 0, 0.3);
-  border-radius: 6px;
-  padding: 8px 10px;
-  font-family: "JetBrains Mono", "SF Mono", SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-size: 11px;
-  color: rgba(255, 255, 255, 0.7);
-  min-height: 28px;
+.tool-activity-card {
+  position: relative;
   display: flex;
   align-items: center;
-  word-break: break-all;
-  animation: terminalFlash 0.3s ease-out;
-  box-shadow: inset 0 1px 6px rgba(0, 0, 0, 0.35);
+  gap: 12px;
+  min-height: 58px;
+  padding: 12px;
+  overflow: hidden;
+  border-radius: 16px;
+  background:
+    linear-gradient(135deg, rgba(255, 255, 255, 0.09), rgba(255, 255, 255, 0.035)),
+    rgba(0, 0, 0, 0.24);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 12px 28px rgba(0, 0, 0, 0.18);
+  animation: toolCardIn 0.22s ease-out;
 }
 
-.terminal-text {
-  color: rgba(174, 255, 196, 0.82);
+.tool-activity-card::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(100deg, transparent 0%, rgba(255, 255, 255, 0.08) 45%, transparent 75%);
+  transform: translateX(-100%);
+  animation: activitySweep 1.8s ease-in-out infinite;
+  pointer-events: none;
 }
 
-.cursor-blink {
-  animation: blink 1s step-end infinite;
-  margin-left: 2px;
+.tool-activity-card.tone-blue {
+  --activity-color: #0A84FF;
 }
 
-@keyframes blink {
-  0%, 100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0;
-  }
+.tool-activity-card.tone-green {
+  --activity-color: var(--agent-color);
 }
 
-@keyframes terminalFlash {
+.tool-activity-card.tone-red {
+  --activity-color: #FF453A;
+}
+
+.tool-loader {
+  position: relative;
+  width: 34px;
+  height: 34px;
+  flex: 0 0 34px;
+  border-radius: 12px;
+  background:
+    radial-gradient(circle at 50% 50%, color-mix(in srgb, var(--activity-color) 30%, transparent), transparent 62%),
+    rgba(255, 255, 255, 0.055);
+  border: 1px solid color-mix(in srgb, var(--activity-color) 35%, transparent);
+  display: grid;
+  place-items: center;
+}
+
+.tool-loader::before {
+  content: '';
+  position: absolute;
+  inset: 7px;
+  border-radius: 999px;
+  border: 2px solid color-mix(in srgb, var(--activity-color) 26%, transparent);
+  border-top-color: var(--activity-color);
+  animation: toolSpin 0.85s linear infinite;
+}
+
+.tool-loader span {
+  width: 3px;
+  height: 3px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.88);
+  opacity: 0.42;
+  animation: toolDot 1.1s ease-in-out infinite;
+}
+
+.tool-loader span:nth-child(2) {
+  animation-delay: 0.14s;
+}
+
+.tool-loader span:nth-child(3) {
+  animation-delay: 0.28s;
+}
+
+.tool-activity-copy {
+  position: relative;
+  z-index: 1;
+  min-width: 0;
+}
+
+.tool-activity-kicker {
+  display: block;
+  margin-bottom: 4px;
+  color: color-mix(in srgb, var(--activity-color) 72%, rgba(255, 255, 255, 0.5));
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.11em;
+  text-transform: uppercase;
+}
+
+.tool-activity-copy p {
+  margin: 0;
+  color: rgba(255, 255, 255, 0.9);
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.35;
+}
+
+@keyframes toolCardIn {
   from {
-    background: color-mix(in srgb, var(--agent-color) 15%, transparent);
+    opacity: 0;
+    transform: translateY(4px) scale(0.985);
   }
   to {
-    background: rgba(0, 0, 0, 0.3);
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes activitySweep {
+  0% {
+    transform: translateX(-100%);
+  }
+  55%, 100% {
+    transform: translateX(100%);
+  }
+}
+
+@keyframes toolSpin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes toolDot {
+  0%, 100% {
+    opacity: 0.35;
+    transform: scale(0.8);
+  }
+  50% {
+    opacity: 0.95;
+    transform: scale(1.2);
   }
 }
 
