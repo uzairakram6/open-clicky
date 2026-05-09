@@ -6,7 +6,7 @@ This audit maps `../plan.md` requirements to concrete artifacts and verification
 
 | Requirement | Evidence | Status |
 | --- | --- | --- |
-| Electron + TypeScript + React/Vite app under `linux/` | `package.json`, `vite.config.ts`, `vite.main.config.ts`, `vite.preload.config.ts`, `src/main`, `src/preload`, `src/renderer` | Implemented |
+| Electron + TypeScript + React/Vite app at repo root | `package.json`, `vite.config.ts`, `vite.main.config.ts`, `vite.preload.config.ts`, `src/main`, `src/preload`, `src/renderer` | Implemented |
 | Package AppImage and deb | `npm run build`, `dist/Clicky-0.1.0.AppImage`, `dist/linux-clicky_0.1.0_amd64.deb` | Implemented |
 | Keep API keys server-side through Worker | `src/main/workerApi.ts`; local settings contain only Worker URL and preferences | Implemented |
 | Store only non-secret settings | `src/main/settings.ts` sanitizes settings before write | Implemented |

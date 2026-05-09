@@ -1,10 +1,31 @@
-# Dependencies
+.env
+.env.*
+!.env.example
+
+models/
+src/main/cursor_query
 node_modules/
+dist/
+out/
+release/
+coverage/
+test-results/
+playwright-report/
+blob-report/
+
+*.log
+*.local
+*.tmp
+*.swp
+
+.DS_Store
+Thumbs.db
+
+# Package managers
 .pnp
 .pnp.js
 
-# Build outputs
-dist/
+# TypeScript
 *.tsbuildinfo
 
 # Logs
@@ -18,7 +39,6 @@ lerna-debug.log*
 .vscode/*
 !.vscode/extensions.json
 .idea
-.DS_Store
 *.suo
 *.ntvs*
 *.njsproj
@@ -27,6 +47,3 @@ lerna-debug.log*
 
 # Electron-builder output
 build/
-
-# Testing
-coverage/

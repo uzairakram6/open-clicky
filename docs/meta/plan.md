@@ -2,14 +2,14 @@
 
 ## Summary
 
-Build a new Electron Linux app under linux/ that reuses the existing Cloudflare Worker API contract but replaces all macOS-only client code. V1 targets Wayland + X11, uses a tray panel, toggle-to-record
+Build a new Electron Linux app in this repository that reuses the existing Cloudflare Worker API contract but replaces all macOS-only client code. V1 targets Wayland + X11, uses a tray panel, toggle-to-record
 global shortcut, selected-screen capture, Claude streaming response, AssemblyAI transcription, and ElevenLabs playback. The blue cursor overlay and [POINT:...] animation are out of v1.
 
 References used: Electron globalShortcut with Wayland GlobalShortcutsPortal, Electron desktopCapturer Linux/PipeWire caveat, and Electron Tray Linux behavior.
 
 ## Key Changes
 
-- Add an Electron + TypeScript + React/Vite app in linux/.
+- Add an Electron + TypeScript + React/Vite app at the repository root.
 - Package with electron-builder for AppImage and deb.
 - Keep API keys server-side by routing all Claude, AssemblyAI token, and ElevenLabs calls through the existing Worker.
 - Store only non-secret settings locally: worker base URL, selected Claude model, shortcut preference, selected capture source/session metadata, onboarding/preferences.

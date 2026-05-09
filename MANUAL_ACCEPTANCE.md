@@ -12,7 +12,7 @@ Run this matrix on real desktop sessions before tagging V1. The Electron build a
 
 ## Setup
 
-1. Build packages from `linux/`:
+1. Build packages from the repository root:
 
    ```sh
    npm run build
